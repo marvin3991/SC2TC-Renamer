@@ -1,0 +1,89 @@
+name: Release attachments
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  RELEASE_LOG_RETENTION_DAYS: 7
+
+jobs:
+  release:
+    runs-on: windows-latest
+    # Covers checks, complete vendoring, release build and an independent offline source check.
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.98.0'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - name: Require matching version tag on merged main
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          python scripts/release-assets.py prepare --tag "$env:RELEASE_TAG" --expected-sha "$env:GITHUB_SHA"
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag validation failed.' }
+      - name: Verify release tooling and Rust before packaging
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          python -m unittest discover -s tests -p test_release.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Python checks failed.' }
+          cargo fmt --all --check
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Rust lint failed.' }
+          cargo test --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
+      - name: Build fixed snapshot and complete source attachments
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          .\build.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed.' }
+      - name: Verify executable and offline corresponding source
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          python scripts/release-assets.py collect
+          if ($LASTEXITCODE -ne 0) { throw 'Attachment verification failed.' }
+      - name: Upload checked attachments and publish draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chcp 65001 > $null
+          python scripts/release-assets.py publish --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed; existing draft was preserved.' }
+      - name: Retain build and verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/rust-*/*.log
+            dist/rust-*/input-source-sha256.json
+            work/release*.json
+            work/release*.log
+            work/release-source-check-*/*.log
+          if-no-files-found: ignore
+          retention-days: ${{ env.RELEASE_LOG_RETENTION_DAYS }}

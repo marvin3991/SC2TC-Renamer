@@ -1,0 +1,11 @@
+* text=auto
+.githooks/* text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.php text eol=lf
+*.png binary
+*.ico binary
+*.zip binary
+# Upstream source hashes are recorded verbatim, including original line endings.
+vendor/mediawiki/upstream-source/** -text

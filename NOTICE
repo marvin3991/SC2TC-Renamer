@@ -1,0 +1,22 @@
+SC2TC-Renamer
+Copyright 2026 marvin3991
+
+SC2TC-Renamer is an independent Windows application.
+Original application source files are available under Apache License 2.0
+(LICENSE). The combined executable contains MediaWiki Chinese conversion
+tables supplied through zhconv 0.4.2, originally GPL-2.0-or-later, and is
+distributed under GNU GPL version 3 only (COPYING).
+
+The same-version complete corresponding source archive accompanies the
+executable distribution. Redistributors must preserve the required license,
+copyright and attribution notices and provide the corresponding source.
+
+zhconv library: Copyright Hung-I Wang and contributors; MIT OR Apache-2.0.
+MediaWiki conversion tables: MediaWiki contributors; GPL-2.0-or-later.
+Exact provenance is recorded in licenses/mediawiki/provenance.json. Original
+tables, generators and third-party sources accompany the source archive.
+
+Rust dependencies and bundled fallback fonts retain their separate licenses.
+The complete upstream sources preserve their optional components and original
+notices; presence in a source archive does not imply an enabled build feature.
+See THIRD_PARTY_NOTICES.md and licenses/ for the complete notices.

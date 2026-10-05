@@ -1,0 +1,15 @@
+{
+  "component": "MediaWiki Chinese conversion tables",
+  "license": "GPL-2.0-or-later",
+  "combined_distribution_license": "GPL-3.0-only",
+  "zhconv_version": "0.4.2",
+  "zhconv_features": [
+    "_mediawiki-base",
+    "mediawiki-hant",
+    "mediawiki-tw"
+  ],
+  "mediawiki_commit": "ecf4342132cf089ac0c42436827e9038a738bb6f",
+  "table_path": "data/ZhConversion.php",
+  "table_sha256": "5cb0019b32bb39ec5c6e662029f90bd166f7a844efb3bc877f9be41fdd511bf2",
+  "source_url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/includes/Languages/Data/ZhConversion.php"
+}

@@ -1,0 +1,137 @@
+{
+  "mediawiki_commit": "ecf4342132cf089ac0c42436827e9038a738bb6f",
+  "files": [
+    {
+      "path": "maintenance/language/zhtable/.gitignore",
+      "sha256": "6c4fde3e3860eef3ee9c1692ea55536aceee54ae0956553589a6bd8ea1e7be0f",
+      "bytes": 21,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/.gitignore"
+    },
+    {
+      "path": "maintenance/language/zhtable/Makefile",
+      "sha256": "e7538d5bd0b593c4998c2d8a562d76ca3bdd75b03aebae5bf6f2ddb7879484d6",
+      "bytes": 99,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/Makefile"
+    },
+    {
+      "path": "maintenance/language/zhtable/Makefile.py",
+      "sha256": "291ba5e0a81c74258a77e030a3f4b659b97eac7b6f20df62cfa6b7f1adc9523c",
+      "bytes": 14486,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/Makefile.py"
+    },
+    {
+      "path": "maintenance/language/zhtable/README",
+      "sha256": "f67566349e15ce2eafd0e9cedf79eb097e07fa5c7e76320ca379cad82e3a1943",
+      "bytes": 1326,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/README"
+    },
+    {
+      "path": "maintenance/language/zhtable/simp2trad.manual",
+      "sha256": "8d5954a105eeb7e70cb52f042f204212f797a5b063d693c159499b4f4f1e45cc",
+      "bytes": 7850,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/simp2trad.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/simp2trad_noconvert.manual",
+      "sha256": "81e9f94b259db0cffbafe1608e8a8aecb9f63e448f8245fd7d4d6facb1df479d",
+      "bytes": 76,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/simp2trad_noconvert.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/simp2trad_supp_set.manual",
+      "sha256": "0b8deec10634017dcdec9ddbe059d5844d075da838a756842e9c37b8f9533665",
+      "bytes": 15,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/simp2trad_supp_set.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/simpphrases.manual",
+      "sha256": "b6056859ce7ae65640cf179bff529efe29c2134fe0984d3f630959e8e47c6cf9",
+      "bytes": 2163,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/simpphrases.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/simpphrases_exclude.manual",
+      "sha256": "91b81fd7caa6a53548a689cccddccb409cb00da71c1c7c8afb288629e636788f",
+      "bytes": 235,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/simpphrases_exclude.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/symme_supp.manual",
+      "sha256": "1bc771fa7e4f8ee8e412416590336aa262bb5a41d0e8c5208ef8e5c4ad7b144c",
+      "bytes": 4987,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/symme_supp.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/toCN.manual",
+      "sha256": "e50ed2e17c4240c09ceb5da63bd3d8a8b7320df60e39063b3b55987748df51ad",
+      "bytes": 41918,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/toCN.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/toHK.manual",
+      "sha256": "7823cbc9d64f572b1c2b46c4478d6bd559d2f3a83549f52e80adc024ccf6d1b4",
+      "bytes": 48453,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/toHK.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/toSimp.manual",
+      "sha256": "a719cb12204103a6af4e99abcd766c9fdd2b46d59c4f3c320c77a8b1aa7ca678",
+      "bytes": 3748,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/toSimp.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/toTW.manual",
+      "sha256": "94853c7075510f9022f5423ee071978f117ee1311d463e39547e33be65ffa937",
+      "bytes": 21844,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/toTW.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/toTrad.manual",
+      "sha256": "bcaf91a538c3f896402fc5e7f3e145e0a2b7da833e0c0547355f1af9064b8fc7",
+      "bytes": 8781,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/toTrad.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/trad2simp.manual",
+      "sha256": "02f9d7e7b1fe37a2ec853f3dc20c3cf28de2b856467ff4394242c32446cbc063",
+      "bytes": 18852,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/trad2simp.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/trad2simp_noconvert.manual",
+      "sha256": "fd6cf80c7710680d442fb04d38e6db31b5cb1a988e538b7c3450f7a356429557",
+      "bytes": 74,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/trad2simp_noconvert.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/trad2simp_supp_set.manual",
+      "sha256": "a987a80c52c0ba86cf1374f9e374baac131a2aeaf0561b5565cfcdff21fc44e5",
+      "bytes": 23,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/trad2simp_supp_set.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/tradphrases.manual",
+      "sha256": "65efbab7faffe3c4e25c4d3a590bced7829427ac50b1ad41a29aea97d92e7e45",
+      "bytes": 36870,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/tradphrases.manual"
+    },
+    {
+      "path": "maintenance/language/zhtable/tradphrases_exclude.manual",
+      "sha256": "08034baeca2496744eb53402f731604335d7745a7764278da286b5be5b833640",
+      "bytes": 5180,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/maintenance/language/zhtable/tradphrases_exclude.manual"
+    },
+    {
+      "path": "COPYING",
+      "sha256": "ea5429175b5ed3b83131d2a3b848ef1bd0142a6192e1027be9e1efaf031a3928",
+      "bytes": 19309,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/COPYING"
+    },
+    {
+      "path": "CREDITS",
+      "sha256": "f8b62567384d3780978933b35fc506fd1dafe8bbb7472642a56ecb9810f76119",
+      "bytes": 16669,
+      "url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/CREDITS"
+    }
+  ]
+}

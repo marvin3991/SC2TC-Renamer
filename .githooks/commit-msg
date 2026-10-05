@@ -1,0 +1,19 @@
+#!/bin/sh
+# Preserve human collaborators while removing AI attribution.
+msg_file="$1"
+tmp_file="${msg_file}.strip.$$"
+LC_ALL=C grep -a -v -i -E \
+  -e '^[[:space:]]*co-authored-by:.*<[^>]*@(anthropic|openai)\.com>' \
+  -e '^[[:space:]]*co-authored-by:[[:space:]]*claude code' \
+  -e '^[[:space:]]*co-authored-by:.*\+copilot@users\.noreply\.github\.com>' \
+  -e '^[[:space:]]*claude-session:' \
+  -e '^[[:space:]]*https://claude\.ai/code/session_' \
+  -e 'generated with \[?claude code' \
+  "$msg_file" > "$tmp_file"
+status=$?
+if [ "$status" -gt 1 ]; then
+  rm -f "$tmp_file"
+  echo "commit-msg hook: unable to process message (grep exit $status)" >&2
+  exit "$status"
+fi
+mv "$tmp_file" "$msg_file"

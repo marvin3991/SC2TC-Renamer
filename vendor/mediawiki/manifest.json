@@ -1,0 +1,20 @@
+{
+  "engine": "zhconv",
+  "engine_version": "0.4.2",
+  "tables": "MediaWiki",
+  "source_file": "ZhConversion.php",
+  "source_sha256": "5cb0019b32bb39ec5c6e662029f90bd166f7a844efb3bc877f9be41fdd511bf2",
+  "mediawiki_commit": "ecf4342132cf089ac0c42436827e9038a738bb6f",
+  "crate_version": "0.4.2",
+  "crate_sha256": "fbb4f247ec21be13451293e760f6246e57300ce80208231ab3e0a437a5d96b27",
+  "crate_url": "https://static.crates.io/crates/zhconv/zhconv-0.4.2.crate",
+  "source_url": "https://github.com/wikimedia/mediawiki/blob/ecf4342132cf089ac0c42436827e9038a738bb6f/includes/Languages/Data/ZhConversion.php",
+  "license": "GPL-2.0-or-later",
+  "table_counts": {
+    "ZH_TO_HANT": 9776,
+    "ZH_TO_HANS": 4685,
+    "ZH_TO_TW": 971,
+    "ZH_TO_HK": 2531,
+    "ZH_TO_CN": 2125
+  }
+}
