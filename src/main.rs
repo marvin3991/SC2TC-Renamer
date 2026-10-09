@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use eframe::egui;
 use sc2tc_renamer::{diagnostics, engine, ui};
-use std::{path::PathBuf, time::Instant};
+use std::{ffi::OsString, path::PathBuf, time::Instant};
 use windows_sys::Win32::{
     Foundation::RECT,
     UI::{
@@ -87,9 +87,17 @@ impl eframe::App for Smoke {
                 let viewport = ctx.content_rect();
                 let visible =
                     viewport.contains_rect(bounds.execute) && viewport.contains_rect(bounds.scan);
+                let minimum = [viewport.width(), viewport.height()];
+                // A small high-DPI screen can clamp the window below MIN_SIZE,
+                // so the minimum capture only counts when the size really matches.
+                let captured = diagnostics::size_matches(
+                    minimum,
+                    [ui::MIN_SIZE.x, ui::MIN_SIZE.y],
+                    diagnostics::SIZE_TOLERANCE,
+                );
                 let _ = diagnostics::write_json(
                     &self.out.join("ui-verification.json"),
-                    &serde_json::json!({"engine":"MediaWiki","mode":self.app.mode.name(),"native_window_created":true,"default_and_minimum_captured":true,"footer_buttons_visible":visible,"minimum_size":[viewport.width(),viewport.height()]}),
+                    &serde_json::json!({"engine":"MediaWiki","mode":self.app.mode.name(),"native_window_created":true,"default_and_minimum_captured":captured,"footer_buttons_visible":visible,"fonts_loaded":self.app.fonts_loaded(),"minimum_size":minimum,"expected_minimum_size":[ui::MIN_SIZE.x,ui::MIN_SIZE.y]}),
                 );
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.stage = 4;
@@ -112,8 +120,7 @@ impl eframe::App for Smoke {
     }
 }
 
-fn run() -> Result<()> {
-    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+fn run(args: &[OsString]) -> Result<()> {
     if args.first().is_some_and(|s| s == "--self-test-update") {
         let path = PathBuf::from(args.get(1).context("請指定尚不存在的更新測試資料夾")?);
         let path = sc2tc_renamer::native::absolute(&path)?;
@@ -211,25 +218,59 @@ fn run() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     if smoke {
-        let output = PathBuf::from(args.get(1).unwrap());
-        let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(output.join("ui-verification.json"))?)?;
+        let output = PathBuf::from(args.get(1).context("請指定尚不存在的 UI 測試資料夾")?);
+        let verification = output.join("ui-verification.json");
+        let bytes = match std::fs::read(&verification) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // The window closes early on a screenshot failure or timeout;
+                // carry those reports into the error instead of only "not found".
+                let details = ["ui-failure.json", "ui-timeout.json"]
+                    .iter()
+                    .filter_map(|name| {
+                        std::fs::read_to_string(output.join(name))
+                            .ok()
+                            .map(|text| format!("\n{name}：{}", text.trim()))
+                    })
+                    .collect::<String>();
+                anyhow::bail!(
+                    "讀不到 UI 驗證結果 {}：{error}{details}",
+                    verification.display()
+                );
+            }
+        };
+        let report: serde_json::Value = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(
             report["footer_buttons_visible"] == true,
             "底部按鈕可見性檢查失敗"
+        );
+        anyhow::ensure!(
+            report["default_and_minimum_captured"] == true,
+            "最小視窗尺寸不符：實際 {}，預期 {}",
+            report["minimum_size"],
+            report["expected_minimum_size"]
         );
     }
     Ok(())
 }
 fn main() {
-    if let Err(error) = run() {
-        if let Some(out) = std::env::args_os().nth(2) {
-            let path = PathBuf::from(out);
-            let report = path.with_extension("failure.json");
-            let _ = diagnostics::write_json(
-                &report,
-                &serde_json::json!({"error":format!("{error:#}")}),
-            );
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Err(error) = run(&args) {
+        if let Some(report) = diagnostics::failure_report_path(&args) {
+            eprintln!("{error:#}");
+            if let Some(parent) = report.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(write_error) =
+                diagnostics::write_json(&report, &serde_json::json!({"error":format!("{error:#}")}))
+            {
+                eprintln!("無法寫入失敗報告 {}：{write_error:#}", report.display());
+            }
+        } else if args.first().is_some_and(diagnostics::is_cli_flag) {
+            // A flag without its output path: report on the console only, so
+            // unattended scripts are never blocked by a dialog.
+            eprintln!("{error:#}");
+            std::process::exit(2);
         } else {
             let text = sc2tc_renamer::native::wide(std::ffi::OsStr::new(&format!(
                 "無法開啟程式：\n{error:#}"
