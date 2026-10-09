@@ -21,6 +21,8 @@ SOURCE_FILES = (
 )
 # examples/prepare_icon.rs generates assets/app.ico from assets/logo-v2.png.
 SOURCE_DIRECTORIES = ('src', 'assets', 'licenses', 'docs', 'examples', 'vendor/mediawiki')
+# Top-level documents copied into the portable ZIP; README.md links to CHANGELOG.md.
+PORTABLE_FILES = ('README.md', 'CHANGELOG.md', 'LICENSE', 'COPYING', 'NOTICE', 'THIRD_PARTY_NOTICES.md')
 # File-manager metadata listed in .gitignore; a local snapshot must not ship it.
 OS_METADATA_NAMES = ('thumbs.db', 'desktop.ini', '.ds_store')
 OS_METADATA_PREFIXES = ('~$',)
@@ -142,7 +144,7 @@ def main():
     portable = destination / ('SC2TC-Renamer-' + version + '-portable')
     portable.mkdir()
     shutil.copyfile(build_target / RUST_TARGET / 'release' / 'SC2TC-Renamer.exe', portable / 'SC2TC-Renamer.exe')
-    for filename in ('README.md', 'LICENSE', 'COPYING', 'NOTICE', 'THIRD_PARTY_NOTICES.md'):
+    for filename in PORTABLE_FILES:
         shutil.copyfile(snapshot / filename, portable / filename)
     shutil.copytree(snapshot / 'licenses', portable / 'licenses')
     shutil.copytree(snapshot / 'docs', portable / 'docs')
