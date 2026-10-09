@@ -1,6 +1,6 @@
 [package]
 name = "sc2tc-renamer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Offline Chinese filename conversion with preview and recovery"
