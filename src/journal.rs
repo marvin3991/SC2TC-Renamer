@@ -10,7 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
 
@@ -45,6 +45,33 @@ struct UndoPlan {
 
 const RESCAN_HINT: &str = "預覽後範圍已變動，請重新掃描產生新的預覽";
 const MANUAL_RESTORE_HINT: &str = "範圍內有與本次改名無關的項目變動，無法自動復原；請移除新增的項目或還原變動後重試，或依 preview.csv 手動復原";
+
+/// Adds `hint` to a failed scope check, unless the user stopped the check.
+fn checked(result: Result<()>, cancel: &AtomicBool, hint: &'static str) -> Result<()> {
+    match result {
+        Err(error) if !cancel.load(Ordering::Relaxed) => Err(error.context(hint)),
+        other => other,
+    }
+}
+
+/// Explains a failed scope check before undo. `engine::verify` states its
+/// rescan advice on the first line and lists the differing paths after it;
+/// rescanning cannot help a recovery, so only the paths are kept.
+fn undo_checked(result: Result<()>, cancel: &AtomicBool) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(error);
+    }
+    let message = error.to_string();
+    match message.split_once('\n') {
+        Some((_, sample)) if error.chain().count() == 1 => {
+            bail!("{MANUAL_RESTORE_HINT}。\n{sample}")
+        }
+        _ => Err(error.context(MANUAL_RESTORE_HINT)),
+    }
+}
 
 impl Journal {
     pub fn create(base: &Path, plan: &Plan) -> Result<Self> {
@@ -171,7 +198,11 @@ pub fn apply(
     {
         bail!("字典版本已變更，請重新掃描，避免套用舊字典的預覽。");
     }
-    engine::verify(plan, &BTreeSet::new(), cancel, progress).context(RESCAN_HINT)?;
+    checked(
+        engine::verify(plan, &BTreeSet::new(), cancel, progress),
+        cancel,
+        RESCAN_HINT,
+    )?;
     journal.append("apply_start", json!({}))?;
     let mut active = BTreeSet::new();
     let mut mapping = HashMap::new();
@@ -306,7 +337,9 @@ fn describe(probe: &Probe) -> &'static str {
 
 /// Decides whether an interrupted operation moved the item, using the
 /// recorded identity first and, on volumes that renumber items when they are
-/// renamed, the unchanged kind, size and modification time.
+/// renamed, the unchanged kind, size and modification time. The fallback
+/// applies to whichever name the interrupted rename or undo moved the item to,
+/// and only while the other name is empty.
 fn reconcile(
     row: &Row,
     expected: &Identity,
@@ -315,15 +348,21 @@ fn reconcile(
 ) -> Result<(bool, Option<Identity>)> {
     let before = probe(original, expected)?;
     let after = probe(changed, expected)?;
+    let renumbered = |info: &native::Metadata| {
+        !info.link
+            && info.directory == (row.kind == Kind::Dir)
+            && info.identity.volume == expected.volume
+            && info.identity.size == expected.size
+            && info.identity.modified_ticks == expected.modified_ticks
+    };
     let decision = match (&before, &after) {
         (Probe::Matches, Probe::Missing | Probe::Other(_)) => Some((false, None)),
         (Probe::Missing | Probe::Other(_), Probe::Matches) => Some((true, None)),
-        (Probe::Missing, Probe::Other(info)) => {
-            let same_kind = info.directory == (row.kind == Kind::Dir);
-            let same_content = info.identity.volume == expected.volume
-                && info.identity.size == expected.size
-                && info.identity.modified_ticks == expected.modified_ticks;
-            (same_kind && same_content).then(|| (true, Some(info.identity.clone())))
+        (Probe::Missing, Probe::Other(info)) if renumbered(info) => {
+            Some((true, Some(info.identity.clone())))
+        }
+        (Probe::Other(info), Probe::Missing) if renumbered(info) => {
+            Some((false, Some(info.identity.clone())))
         }
         _ => None,
     };
@@ -438,8 +477,10 @@ fn prepare_undo_state(
     if state.order.is_empty() {
         bail!("此紀錄只有掃描預覽，未執行改名，沒有可復原的項目；請改選有執行改名的那次紀錄。");
     }
-    engine::verify_with(&plan, &state.active, &state.identities, cancel, progress)
-        .context(MANUAL_RESTORE_HINT)?;
+    undo_checked(
+        engine::verify_with(&plan, &state.active, &state.identities, cancel, progress),
+        cancel,
+    )?;
     let mut actions = vec![];
     let mut mapping = engine::changes(&plan, &state.active);
     for id in state.order.iter().rev().copied() {
@@ -506,9 +547,24 @@ pub fn undo(journal: &Journal, cancel: &AtomicBool, progress: &dyn Fn(String)) -
                 .unwrap_or_else(|| row.identity.clone());
             // Confirm the item before recording the intent, so a source that
             // changed since the preview never leaves an unfinished undo entry.
-            let info = native::metadata(&action.source)?;
-            if info.link || info.identity != expected {
-                bail!("復原來源已變動或被替換，停止：{}", action.source.display());
+            let changed = || format!("復原來源已變動或被替換，停止：{}", action.source.display());
+            match probe(&action.source, &expected).with_context(changed)? {
+                Probe::Matches => {}
+                Probe::Missing if matches!(probe(&action.target, &expected)?, Probe::Matches) => {
+                    // Another program moved the item back after the preview.
+                    // Record what the file system shows so the next undo
+                    // continues from the actual state.
+                    journal.append("undo_intent", json!({"id":action.id}))?;
+                    journal.append(
+                        "intent_reconciled",
+                        json!({"id":action.id,"active":false,"identity":expected}),
+                    )?;
+                    bail!(
+                        "{}\n項目已位於原名稱，已記錄；請確認範圍沒有其他程式在修改後再按復原。",
+                        changed()
+                    );
+                }
+                Probe::Missing | Probe::Other(_) => bail!(changed()),
             }
             journal.append("undo_intent", json!({"id":action.id}))?;
             engine::move_row(
