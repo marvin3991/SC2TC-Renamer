@@ -422,7 +422,14 @@ pub fn make_plan_with_mode(
             native::contains(Path::new(x), Path::new(&scope.path))
                 || native::contains(Path::new(x), Path::new(&scope.canonical))
         });
-        let inside_by_identity = Path::new(&scope.path).ancestors().any(|ancestor| {
+        // The resolved path matters when the scope is an alias (SUBST,
+        // junction) of a folder inside the record directory: the alias itself
+        // has no ancestors there, and its resolved spelling may differ from
+        // the LOCALAPPDATA text (redirected or linked profile folders).
+        let mut ancestors = Path::new(&scope.path)
+            .ancestors()
+            .chain(Path::new(&scope.canonical).ancestors());
+        let inside_by_identity = ancestors.any(|ancestor| {
             native::metadata(ancestor).is_ok_and(|m| {
                 excluded
                     .ids

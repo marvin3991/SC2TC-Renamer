@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     mem,
-    os::windows::ffi::OsStrExt,
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf, Prefix},
     ptr,
 };
@@ -27,6 +27,11 @@ pub const MAX_COMPONENT_UNITS: usize = 255;
 pub const MAX_PATH_UNITS: usize = 32_767;
 pub const OPERATION_BUSY: &str = "另一個視窗正在改名或復原，請稍後再試。";
 const DICTIONARY_BUSY: &str = "另一個視窗正在更新轉換表，請稍後再試。";
+const DEVICE_PATH_UNSUPPORTED: &str =
+    "不支援裝置路徑（\\\\.\\）或 NT 物件路徑；請使用一般磁碟或網路路徑：";
+/// NT object manager namespace prefix (`\??\`), accepted verbatim by
+/// `RtlDosPathNameToNtPathName_U` and never a Win32 path.
+const NT_OBJECT_PREFIX: &str = "\\??\\";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Identity {
@@ -59,6 +64,15 @@ impl Drop for Handle {
 }
 
 pub fn absolute(path: &Path) -> Result<PathBuf> {
+    // Win32 normalisation turns `\??\C:\x` into the drive-relative `C:\??\C:\x`,
+    // so the NT object prefix must be rejected before it is lost.
+    if path
+        .as_os_str()
+        .to_string_lossy()
+        .starts_with(NT_OBJECT_PREFIX)
+    {
+        bail!("{DEVICE_PATH_UNSUPPORTED}{}", path.display());
+    }
     let path = std::path::absolute(path)?;
     if path.to_str().is_none() {
         bail!("路徑不是有效的 Unicode，已停止。");
@@ -70,10 +84,7 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
             | Prefix::UNC(..)
             | Prefix::VerbatimUNC(..) => {}
             Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
-                bail!(
-                    "不支援裝置路徑（\\\\.\\）或 NT 物件路徑；請使用一般磁碟或網路路徑：{}",
-                    path.display()
-                );
+                bail!("{DEVICE_PATH_UNSUPPORTED}{}", path.display());
             }
         },
         _ => bail!("路徑必須包含磁碟代號或網路位置：{}", path.display()),
@@ -105,15 +116,25 @@ pub fn contains(parent: &Path, child: &Path) -> bool {
 
 /// The `\\?\` form of a path: no Win32 normalisation, so names with trailing
 /// dots or spaces and very long paths reach the file system verbatim.
+/// Works on UTF-16 units, so names that are not valid Unicode (unpaired
+/// surrogates) still open the exact item instead of a U+FFFD look-alike.
 pub fn verbatim(path: &Path) -> PathBuf {
-    let value = path.to_string_lossy().replace('/', "\\");
-    if value.starts_with("\\\\?\\") {
-        PathBuf::from(value)
-    } else if let Some(rest) = value.strip_prefix("\\\\") {
-        PathBuf::from(format!("\\\\?\\UNC\\{rest}"))
+    const SLASH: u16 = b'/' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    let units: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| if unit == SLASH { BACKSLASH } else { unit })
+        .collect();
+    let prefix = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let value = if units.starts_with(&prefix("\\\\?\\")) {
+        units
+    } else if let Some(rest) = units.strip_prefix(prefix("\\\\").as_slice()) {
+        [prefix("\\\\?\\UNC\\").as_slice(), rest].concat()
     } else {
-        PathBuf::from(format!("\\\\?\\{value}"))
-    }
+        [prefix("\\\\?\\").as_slice(), &units].concat()
+    };
+    PathBuf::from(OsString::from_wide(&value))
 }
 
 /// Length in UTF-16 units as the kernel sees it (with the `\\?\` prefix).
@@ -324,9 +345,15 @@ impl OperationLock {
     }
     pub fn dictionary() -> Result<Self> {
         const INITIALISATION_TIMEOUT_MS: u32 = 30_000;
+        Self::dictionary_with_timeout(INITIALISATION_TIMEOUT_MS)
+    }
+    /// `dictionary()` with a caller-chosen wait, so tests can observe the busy
+    /// message without waiting for the full initialisation timeout.
+    #[doc(hidden)]
+    pub fn dictionary_with_timeout(timeout_ms: u32) -> Result<Self> {
         Self::named(
             "Local\\SC2TC-RenamerDictionaryInitV1",
-            INITIALISATION_TIMEOUT_MS,
+            timeout_ms,
             DICTIONARY_BUSY,
         )
     }
