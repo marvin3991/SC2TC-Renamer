@@ -76,8 +76,17 @@ class PackageTests(unittest.TestCase):
                 self.assertIn("metadata", str(raised.exception))
                 (self.root / name).unlink()
 
-    def test_repository_snapshot_includes_icon_generator(self):
-        self.assertIn(ROOT / "examples" / "prepare_icon.rs", PACKAGE.source_files())
+    def test_snapshot_collects_icon_generator_from_examples(self):
+        self.tree("Cargo.toml", "examples/prepare_icon.rs")
+        with mock.patch.object(PACKAGE, "ROOT", self.root), \
+                mock.patch.object(PACKAGE, "SOURCE_FILES", ("Cargo.toml",)), \
+                mock.patch.object(PACKAGE, "SOURCE_DIRECTORIES", ("examples",)):
+            files = PACKAGE.source_files()
+        self.assertIn(self.root / "examples" / "prepare_icon.rs", files)
+
+    def test_repository_ships_icon_generator_directory(self):
+        self.assertIn("examples", PACKAGE.SOURCE_DIRECTORIES)
+        self.assertTrue((ROOT / "examples" / "prepare_icon.rs").is_file())
 
     def test_portable_documents_include_changelog_from_snapshot(self):
         self.assertIn("CHANGELOG.md", PACKAGE.PORTABLE_FILES)
