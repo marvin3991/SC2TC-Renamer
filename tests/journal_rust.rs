@@ -907,3 +907,180 @@ fn junction_in_place_of_renamed_folder_is_not_reconciled() {
     assert!(error.contains("存在但身分不符"), "{error}");
     fs::remove_dir(&junction).unwrap();
 }
+
+// journal-1: on NTFS the kind-and-content fallback is closed, so another
+// empty folder found at the new name after an interrupted rename is not
+// claimed as the renamed item.
+#[test]
+fn foreign_empty_folder_at_new_name_is_not_reconciled_on_ntfs() {
+    let _lock = exclusive();
+    let base = fixture();
+    let root = base.join("files");
+    fs::create_dir_all(root.join("简体目录")).unwrap();
+    let plan = plan(&root);
+    let folder = row(&plan, "简体目录");
+    assert_eq!(folder.kind, Kind::Dir);
+    let journal = Journal::create(&base.join("history"), &plan).unwrap();
+    journal.append("apply_start", json!({})).unwrap();
+    journal
+        .append("rename_intent", json!({"id":folder.id}))
+        .unwrap();
+    // The rename never happened; the folder was removed and an unrelated
+    // empty folder was created under the new name.
+    fs::remove_dir(&folder.path).unwrap();
+    let foreign = Path::new(&folder.path).with_file_name(&folder.new);
+    fs::create_dir(&foreign).unwrap();
+    assert!(!native::metadata(&foreign).unwrap().link);
+    let after = snapshot(&root);
+    let error =
+        message(journal::prepare_undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert!(error.contains("存在但身分不符"), "{error}");
+    let error = message(undo(&journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert_eq!(snapshot(&root), after);
+    assert!(!names(&journal).iter().any(|e| e == "intent_reconciled"));
+}
+
+// journal-1, reverse direction: after an interrupted undo, another empty
+// folder at the original name is not claimed either.
+#[test]
+fn foreign_empty_folder_at_original_name_is_not_reconciled_on_ntfs() {
+    let _lock = exclusive();
+    let base = fixture();
+    let root = base.join("files");
+    fs::create_dir_all(root.join("简体目录")).unwrap();
+    let plan = plan(&root);
+    let folder = row(&plan, "简体目录");
+    assert_eq!(folder.kind, Kind::Dir);
+    let journal = Journal::create(&base.join("history"), &plan).unwrap();
+    journal.append("apply_start", json!({})).unwrap();
+    journal
+        .append("rename_intent", json!({"id":folder.id}))
+        .unwrap();
+    let renamed = rename_row(folder);
+    journal
+        .append(
+            "rename_done",
+            json!({"id":folder.id,"identity":identity(&renamed)}),
+        )
+        .unwrap();
+    journal.append("undo_start", json!({})).unwrap();
+    journal
+        .append("undo_intent", json!({"id":folder.id}))
+        .unwrap();
+    // The undo never happened; the renamed folder was removed and an
+    // unrelated empty folder was created under the original name.
+    fs::remove_dir(&renamed).unwrap();
+    fs::create_dir(&folder.path).unwrap();
+    let after = snapshot(&root);
+    let error =
+        message(journal::prepare_undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert!(error.contains("存在但身分不符"), "{error}");
+    let error = message(undo(&journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert_eq!(snapshot(&root), after);
+    assert!(!names(&journal).iter().any(|e| e == "intent_reconciled"));
+}
+
+/// Keeps a file in the classic delete-pending state, in which opening it (even
+/// only to read attributes, with backup semantics) fails with access denied
+/// instead of "not found". Dropping the guard clears the pending deletion
+/// before closing the handle, so the file is never removed.
+struct DeletePending(windows_sys::Win32::Foundation::HANDLE);
+impl DeletePending {
+    fn set(path: &Path) -> Self {
+        use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::*};
+        let name = native::wide(native::verbatim(path).as_os_str());
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                DELETE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            handle,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let pending = Self(handle);
+        assert!(pending.mark(true), "{}", std::io::Error::last_os_error());
+        pending
+    }
+    /// FileDispositionInfo uses the classic (non-POSIX) semantics: the name
+    /// stays until the last handle closes, and the flag can be cleared again.
+    fn mark(&self, delete: bool) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        };
+        let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
+        unsafe {
+            SetFileInformationByHandle(
+                self.0,
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            ) != 0
+        }
+    }
+}
+impl Drop for DeletePending {
+    fn drop(&mut self) {
+        let cleared = self.mark(false);
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+        if !cleared && !std::thread::panicking() {
+            panic!("無法取消測試檔案的刪除標記");
+        }
+    }
+}
+
+// journal-2: a source that exists but cannot be read is reported as
+// unverifiable, not as changed or replaced, and leaves no undo entry.
+#[test]
+fn unreadable_undo_source_is_reported_as_unverifiable() {
+    let _lock = exclusive();
+    let base = fixture();
+    let root = base.join("files");
+    file(&root, "报告.txt");
+    let before = snapshot(&root);
+    let plan = plan(&root);
+    let journal = Journal::create(&base.join("history"), &plan).unwrap();
+    journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
+    let renamed = root.join("報告.txt");
+    let held: RefCell<Option<DeletePending>> = RefCell::new(None);
+    let progress = |message: String| {
+        if held.borrow().is_none() && message.starts_with("復原中") {
+            let pending = DeletePending::set(&renamed);
+            // Precondition: the read-attributes probe fails, and not with
+            // "not found" (which undo reports as a moved item).
+            let error = native::metadata(&renamed).unwrap_err();
+            assert!(
+                error.chain().any(|e| e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound)),
+                "{error:#}"
+            );
+            *held.borrow_mut() = Some(pending);
+        }
+    };
+    let result = journal::undo(&journal, &AtomicBool::new(false), &progress);
+    let was_held = held.borrow_mut().take().is_some();
+    assert!(was_held, "復原未進入逐項核對");
+    let error = message(result.unwrap_err());
+    assert!(error.contains("無法核對復原來源"), "{error}");
+    assert!(!error.contains("已變動或被替換"), "{error}");
+    assert!(!names(&journal).iter().any(|e| e == "undo_intent"));
+    assert!(renamed.exists());
+    // Once the source is readable again, the same record finishes the undo.
+    assert_eq!(undo(&journal).unwrap(), 1);
+    assert_eq!(snapshot(&root), before);
+}
