@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import tomllib
 import zipfile
@@ -21,6 +22,14 @@ MAX_NESTED_TAGS = 5
 CONTEXT_PATH = ROOT / 'work' / 'release-context.json'
 ASSET_ROOT = ROOT / 'work' / 'release-assets'
 PLAN_PATH = ROOT / 'work' / 'release-plan.json'
+# Keep a Changelog version headings, for example "## [1.1.0] - 2026-10-09".
+CHANGELOG_HEADING = re.compile(r'^## \[([^\]]+)\][^\n]*$', re.MULTILINE)
+# Checked by .github/workflows/release.yml to tell a published release apart from a kept draft.
+PUBLISHED_MISMATCH_EXIT_CODE = 3
+
+
+class PublishedReleaseMismatch(ValueError):
+    """The tag already has a published release whose attachments differ from this build."""
 
 
 def run(command, cwd=ROOT, env=None, log=None):
@@ -51,9 +60,31 @@ def validate_tag(tag, version):
         raise ValueError('Tag must equal v plus the stable Cargo package version.')
 
 
+def release_notes(changelog_text, version, source_commit):
+    """Return the Release body: this version's CHANGELOG section plus fixed source and licence notes."""
+    text = changelog_text.replace('\r\n', '\n')
+    headings = list(CHANGELOG_HEADING.finditer(text))
+    sections = [index for index, heading in enumerate(headings) if heading.group(1) == version]
+    if len(sections) != 1:
+        raise ValueError('CHANGELOG.md must contain exactly one section for version ' + version + '.')
+    index = sections[0]
+    end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+    body = text[headings[index].end():end].strip()
+    if not body:
+        raise ValueError('CHANGELOG.md section for version ' + version + ' is empty.')
+    return ('純 MediaWiki 檔名轉換，提供 zh-Hant／zh-TW。下載 portable ZIP 後解壓執行。\n\n'
+            + body + '\n\n---\n\n'
+            '授權全文（LICENSE、COPYING、NOTICE、THIRD_PARTY_NOTICES.md、licenses/）在 portable 與 source ZIP 內；'
+            '附件 SHA-256 見 SHA256SUMS.txt，執行檔 SHA-256 見 release-manifest.json。\n'
+            '作者原始碼為 Apache 2.0；整體程式含 GPL 轉換表，依 GPL 第 3 版交付。\n\n'
+            f'來源提交：`{source_commit}`。下載與存放路徑詳見本版本 README。\n')
+
+
 def prepare(tag, expected_sha):
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
     validate_tag(tag, version)
+    # Fail before the long build when the version has no release notes.
+    release_notes((ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'), version, expected_sha)
     head = run(['git', 'rev-parse', 'HEAD'])
     target = run(['git', 'rev-parse', '--verify', tag + '^{commit}'])
     if head != target or head != expected_sha:
@@ -150,16 +181,21 @@ def collect():
     if (verification.get('version') != version or verification.get('engine') != 'MediaWiki'
             or not verification.get('original_names_restored') or not verification.get('sha256_unchanged')):
         raise ValueError('Executable file operations did not pass.')
+    # Public metadata uses asset and fixture folder names, not runner filesystem locations;
+    # the full paths stay in work/ for diagnosis.
+    for mode in verification.get('modes', []):
+        if isinstance(mode, dict) and 'fixture' in mode:
+            mode['fixture'] = pathlib.PureWindowsPath(str(mode['fixture'])).name
     write_json(ASSET_ROOT / 'verification.json', verification)
     write_json(ASSET_ROOT / 'source-verification.json', verify_source(source, version))
-    # Public metadata uses asset names, not runner filesystem locations.
     manifest.update(context)
     manifest['source_zip'], manifest['portable_zip'], manifest['executable'] = source.name, portable.name, executable.name
     write_json(ASSET_ROOT / 'release-manifest.json', manifest)
     paths = sorted(ASSET_ROOT.iterdir())
+    # Only attachments are listed so `sha256sum -c` works in the download folder; the
+    # executable inside the portable ZIP is hashed in release-manifest.json.
     with (ASSET_ROOT / 'SHA256SUMS.txt').open('x', encoding='utf-8', newline='\n') as stream:
         stream.write(''.join(f'{digest(path)}  {path.name}\n' for path in paths))
-        stream.write(f'{manifest["sha256"][executable.name]}  {executable.name}\n')
     plan = {'tag': context['tag'], 'source_commit': context['source_commit'], 'assets': []}
     for path in sorted(ASSET_ROOT.iterdir()):
         plan['assets'].append({'name': path.name, 'size': path.stat().st_size, 'digest': 'sha256:' + digest(path)})
@@ -167,21 +203,29 @@ def collect():
     print(json.dumps({'tag': plan['tag'], 'assets': [asset['name'] for asset in plan['assets']]}), flush=True)
 
 
-def verify_assets(actual, expected):
-    expected_names = {asset['name'] for asset in expected}
-    if len(expected_names) != len(expected):
-        raise ValueError('Duplicate expected Release asset.')
+def assets_by_name(actual):
     by_name = {}
     for asset in actual:
         if asset['name'] in by_name:
             raise ValueError('Duplicate Release asset.')
         by_name[asset['name']] = asset
+    return by_name
+
+
+def asset_matches(uploaded, expected):
+    return (uploaded.get('state') == 'uploaded' and uploaded.get('size') == expected['size']
+            and uploaded.get('digest') == expected['digest'])
+
+
+def verify_assets(actual, expected):
+    expected_names = {asset['name'] for asset in expected}
+    if len(expected_names) != len(expected):
+        raise ValueError('Duplicate expected Release asset.')
+    by_name = assets_by_name(actual)
     if set(by_name) != expected_names:
         raise ValueError('Release attachment set is incomplete or contains unexpected files.')
     for asset in expected:
-        uploaded = by_name[asset['name']]
-        if (uploaded.get('state') != 'uploaded' or uploaded.get('size') != asset['size']
-                or uploaded.get('digest') != asset['digest']):
+        if not asset_matches(by_name[asset['name']], asset):
             raise ValueError('Release attachment verification failed: ' + asset['name'])
 
 
@@ -243,6 +287,12 @@ class GhClient:
         run(['gh', 'api', endpoint, '--method', 'POST', '--header', 'Content-Type: application/octet-stream',
              '--input', str(path)])
 
+    def delete_asset(self, asset):
+        asset_id = asset.get('id')
+        if not isinstance(asset_id, int) or isinstance(asset_id, bool):
+            raise ValueError('Release asset has no numeric id.')
+        run(['gh', 'api', f'repos/{self.repo}/releases/assets/{asset_id}', '--method', 'DELETE'])
+
     def publish(self, release):
         run(['gh', 'api', f'repos/{self.repo}/releases/{release["id"]}', '--method', 'PATCH', '-F', 'draft=false'])
 
@@ -261,12 +311,22 @@ def publish_plan(client, plan, asset_root, notes):
     if release is None or release['tag_name'] != tag or release.get('prerelease'):
         raise ValueError('Release metadata does not match the stable version tag.')
     actual = client.assets(release)
-    names = {asset['name'] for asset in actual}
     if not release['draft']:
-        verify_assets(actual, plan['assets'])
+        try:
+            verify_assets(actual, plan['assets'])
+        except ValueError as error:
+            raise PublishedReleaseMismatch('Release ' + tag + ' is already published and its attachments '
+                                           'differ from this build; it was not modified. ' + str(error)) from error
         return release
+    existing = assets_by_name(actual)
     for asset in plan['assets']:
-        if asset['name'] not in names:
+        uploaded = existing.get(asset['name'])
+        if uploaded is not None and not asset_matches(uploaded, asset):
+            # Rebuilt ZIPs differ byte for byte, so a rerun replaces what an interrupted
+            # run left in the unpublished draft instead of failing on it forever.
+            client.delete_asset(uploaded)
+            uploaded = None
+        if uploaded is None:
             client.upload(release, asset_root / asset['name'])
     verify_assets(client.assets(release), plan['assets'])
     client.publish(release)
@@ -293,12 +353,15 @@ def main():
         collect()
     else:
         plan = json.loads(PLAN_PATH.read_text(encoding='utf-8'))
+        context = json.loads(CONTEXT_PATH.read_text(encoding='utf-8'))
         notes = ROOT / 'work/release-notes.md'
-        notes.write_text('純 MediaWiki 檔名轉換，提供 zh-Hant／zh-TW。\n\n'
-                         '下載 portable ZIP 後解壓執行。完整 source ZIP、授權與 SHA-256 同列於附件。\n'
-                         '作者原始碼為 Apache 2.0；整體程式含 GPL 轉換表，依 GPL 第 3 版交付。\n\n'
-                         f'來源提交：`{plan["source_commit"]}`。下載與存放路徑詳見本版本 README。\n', encoding='utf-8')
-        release = publish_plan(GhClient(args.repo), plan, ASSET_ROOT, notes)
+        notes.write_text(release_notes((ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'),
+                                       context['version'], plan['source_commit']), encoding='utf-8')
+        try:
+            release = publish_plan(GhClient(args.repo), plan, ASSET_ROOT, notes)
+        except PublishedReleaseMismatch as error:
+            print(error, file=sys.stderr, flush=True)
+            raise SystemExit(PUBLISHED_MISMATCH_EXIT_CODE) from error
         write_json(ROOT / 'work/release-published.json', {'url': release['html_url'], 'tag': release['tag_name'], 'draft': release['draft']})
         print(release['html_url'])
 

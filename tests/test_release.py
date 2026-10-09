@@ -21,6 +21,24 @@ SPEC.loader.exec_module(RELEASE)
 SOURCE_ROOT = "SC2TC-Renamer-1.0.0-source"
 COMMIT = "a" * 40
 OTHER_COMMIT = "b" * 40
+CHANGELOG = """# 變更紀錄
+
+## [1.0.1] - 2026-10-10
+
+### Fixed
+
+- 合成的下一版修正。
+
+## [1.0.0] - 2026-10-05
+
+### Added
+
+- 合成的首版功能。
+
+## [0.9.0] - 2026-09-01
+
+- 合成的前一版內容。
+"""
 
 
 class DraftLookupTests(unittest.TestCase):
@@ -50,6 +68,18 @@ class DraftLookupTests(unittest.TestCase):
             client.publish(draft)
             self.assertIn("repos/owner/repo/releases/7", api.call_args.args[0])
             self.assertIn("draft=false", api.call_args.args[0])
+
+    def test_delete_asset_uses_numeric_asset_id(self):
+        with mock.patch.object(RELEASE, "run", return_value="") as api:
+            client = RELEASE.GhClient("owner/repo")
+            client.delete_asset({"id": 42, "name": "source.zip"})
+            command = api.call_args.args[0]
+            self.assertIn("repos/owner/repo/releases/assets/42", command)
+            self.assertEqual(command[command.index("--method") + 1], "DELETE")
+            for asset in [{"name": "source.zip"}, {"id": "42"}, {"id": True}]:
+                with self.subTest(asset=asset), self.assertRaises(ValueError):
+                    client.delete_asset(asset)
+            api.assert_called_once()
 
     def test_draft_is_found_in_paginated_release_list_after_tag_endpoint_404(self):
         response = mock.Mock(returncode=1, stderr="gh: Not Found (HTTP 404)", stdout="")
@@ -88,6 +118,7 @@ class FakeGhClient:
         self.commit = commit
         self.events = []
         self.corrupt_upload = False
+        self.next_id = 100
 
     def tag_commit(self, tag):
         self.events.append(("tag_commit", tag))
@@ -121,9 +152,20 @@ class FakeGhClient:
         digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
         if self.corrupt_upload:
             digest = "sha256:" + "0" * 64
+        self.next_id += 1
         self.uploaded.append({
-            "name": path.name, "size": path.stat().st_size, "digest": digest, "state": "uploaded",
+            "id": self.next_id, "name": path.name, "size": path.stat().st_size, "digest": digest,
+            "state": "uploaded",
         })
+
+    def delete_asset(self, asset):
+        self.events.append(("delete", asset["name"]))
+        if not self.value["draft"]:
+            raise AssertionError("The publisher attempted to delete an asset of a published release.")
+        remaining = [item for item in self.uploaded if item["id"] != asset["id"]]
+        if len(remaining) != len(self.uploaded) - 1:
+            raise AssertionError("The publisher deleted an unknown asset.")
+        self.uploaded = remaining
 
     def publish(self, release):
         tag = release["tag_name"]
@@ -131,7 +173,7 @@ class FakeGhClient:
         self.value["draft"] = False
 
     def writes(self):
-        return [event for event in self.events if event[0] in ("create", "upload", "publish")]
+        return [event for event in self.events if event[0] in ("create", "upload", "delete", "publish")]
 
 
 class ReleaseTests(unittest.TestCase):
@@ -158,7 +200,10 @@ class ReleaseTests(unittest.TestCase):
         self.plan = {"tag": "v1.0.0", "source_commit": COMMIT, "assets": self.expected}
 
     def uploaded(self):
-        return [dict(asset, state="uploaded") for asset in self.expected]
+        return [dict(asset, state="uploaded", id=index + 1) for index, asset in enumerate(self.expected)]
+
+    def changelog(self, text=CHANGELOG):
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
 
     def metadata(self, draft=True):
         return {
@@ -195,6 +240,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_prepare_rejects_checkout_tag_trigger_and_cargo_mismatches(self):
         (self.root / "Cargo.toml").write_text('[package]\nversion = "1.0.0"\n', encoding="utf-8")
+        self.changelog()
         context = self.root / "context.json"
         for tag_commit, triggering, dirty in [
             (OTHER_COMMIT, COMMIT, ""), (COMMIT, OTHER_COMMIT, ""), (COMMIT, COMMIT, " M src/main.rs"),
@@ -218,6 +264,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_prepare_records_matching_commit_without_network(self):
         (self.root / "Cargo.toml").write_text('[package]\nversion = "1.0.0"\n', encoding="utf-8")
+        self.changelog()
         responses = {
             ("git", "rev-parse", "HEAD"): COMMIT,
             ("git", "rev-parse", "--verify", "v1.0.0^{commit}"): COMMIT,
@@ -232,6 +279,61 @@ class ReleaseTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             RELEASE.prepare("v1.0.0", COMMIT)
         self.assertIn(COMMIT, context.read_text(encoding="utf-8"))
+
+    def test_prepare_stops_when_tag_is_not_on_main(self):
+        (self.root / "Cargo.toml").write_text('[package]\nversion = "1.0.0"\n', encoding="utf-8")
+        self.changelog()
+        responses = {
+            ("git", "rev-parse", "HEAD"): COMMIT,
+            ("git", "rev-parse", "--verify", "v1.0.0^{commit}"): COMMIT,
+            ("git", "status", "--porcelain", "--untracked-files=no"): "",
+        }
+
+        def command(args):
+            if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+                raise RuntimeError("git failed: not an ancestor")
+            return responses[tuple(args)]
+        context = self.root / "context.json"
+        with mock.patch.object(RELEASE, "ROOT", self.root), \
+                mock.patch.object(RELEASE, "CONTEXT_PATH", context), \
+                mock.patch.object(RELEASE, "run", side_effect=command):
+            with self.assertRaises(RuntimeError):
+                RELEASE.prepare("v1.0.0", COMMIT)
+        self.assertFalse(context.exists())
+
+    def test_prepare_requires_release_notes_before_any_command(self):
+        (self.root / "Cargo.toml").write_text('[package]\nversion = "1.0.0"\n', encoding="utf-8")
+        self.changelog(CHANGELOG.replace("## [1.0.0] - 2026-10-05", "## [1.0.2] - 2026-10-05"))
+        context = self.root / "context.json"
+        with mock.patch.object(RELEASE, "ROOT", self.root), \
+                mock.patch.object(RELEASE, "CONTEXT_PATH", context), \
+                mock.patch.object(RELEASE, "run") as command:
+            with self.assertRaises(ValueError):
+                RELEASE.prepare("v1.0.0", COMMIT)
+            command.assert_not_called()
+        self.assertFalse(context.exists())
+
+    def test_release_notes_use_only_the_matching_changelog_section(self):
+        notes = RELEASE.release_notes(CHANGELOG.replace("\n", "\r\n"), "1.0.0", COMMIT)
+        self.assertIn("合成的首版功能。", notes)
+        self.assertIn("### Added", notes)
+        self.assertNotIn("合成的下一版修正。", notes)
+        self.assertNotIn("合成的前一版內容。", notes)
+        self.assertNotIn("## [", notes)
+        self.assertIn("來源提交：`" + COMMIT + "`", notes)
+        self.assertIn("SHA256SUMS.txt", notes)
+        self.assertNotIn("同列於附件", notes)
+        self.assertIn("合成的前一版內容。", RELEASE.release_notes(CHANGELOG, "0.9.0", COMMIT))
+
+    def test_release_notes_reject_missing_empty_or_duplicate_sections(self):
+        for name, text in [
+            ("missing", CHANGELOG),
+            ("empty", CHANGELOG.replace("- 合成的前一版內容。\n", "\n  \n")),
+            ("duplicate", CHANGELOG + "\n## [0.9.0] - 2026-09-02\n\n- 重複。\n"),
+        ]:
+            version = "2.0.0" if name == "missing" else "0.9.0"
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                RELEASE.release_notes(text, version, COMMIT)
 
     def test_asset_verification_rejects_missing_extra_duplicate_size_hash_and_starter(self):
         RELEASE.verify_assets(self.uploaded(), self.expected)
@@ -335,15 +437,32 @@ class ReleaseTests(unittest.TestCase):
             self.publish(client)
         self.assertEqual(client.writes(), [])
 
-    def test_mismatched_existing_draft_preserves_asset_and_never_publishes(self):
+    def test_mismatched_existing_draft_asset_is_replaced_before_publishing(self):
         assets = self.uploaded()
         assets[0]["digest"] = "sha256:" + "0" * 64
+        assets[1]["state"] = "open"
         client = FakeGhClient(self.metadata(), assets)
-        with self.assertRaises(ValueError):
+        release = self.publish(client)
+        self.assertFalse(release["draft"])
+        writes = client.writes()
+        replaced = [self.expected[0]["name"], self.expected[1]["name"]]
+        self.assertEqual([event[1] for event in writes if event[0] == "delete"], replaced)
+        self.assertEqual([event[2] for event in writes if event[0] == "upload"], replaced)
+        for name in replaced:
+            self.assertLess(writes.index(("delete", name)), writes.index(("upload", self.plan["tag"], name)))
+        self.assertEqual(writes[-1], ("publish", self.plan["tag"]))
+        RELEASE.verify_assets(client.uploaded, self.expected)
+
+    def test_changed_published_release_reports_published_state_without_writes(self):
+        assets = self.uploaded()
+        assets[0]["digest"] = "sha256:" + "0" * 64
+        client = FakeGhClient(self.metadata(draft=False), assets)
+        with self.assertRaises(RELEASE.PublishedReleaseMismatch) as raised:
             self.publish(client)
-        self.assertTrue(client.value["draft"])
         self.assertEqual(client.writes(), [])
         self.assertEqual(client.uploaded, assets)
+        self.assertIn("already published", str(raised.exception))
+        self.assertNotIn("draft", str(raised.exception).lower())
 
     def test_corrupt_new_upload_stays_draft(self):
         client = FakeGhClient()
@@ -443,6 +562,7 @@ class ReleaseTests(unittest.TestCase):
             (fixture / "verification.json").write_text(json.dumps({
                 "version": "1.0.0", "engine": "MediaWiki",
                 "original_names_restored": True, "sha256_unchanged": True,
+                "modes": [{"mode": mode, "fixture": str(fixture / mode)} for mode in ("zh-Hant", "zh-TW")],
             }), encoding="utf-8")
             return ""
         with mock.patch.object(RELEASE, "ROOT", self.root), \
@@ -467,7 +587,24 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(asset["digest"], "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
             self.assertEqual(asset["size"], path.stat().st_size)
         checksums = (assets / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
-        self.assertIn(hashes[executable.name] + "  " + executable.name, checksums)
+        self.assertNotIn(hashes[executable.name] + "  " + executable.name, checksums)
+        listed = {}
+        for line in checksums:
+            value, name = line.split("  ", 1)
+            self.assertTrue((assets / name).is_file(), name)
+            self.assertEqual(value, hashlib.sha256((assets / name).read_bytes()).hexdigest())
+            listed[name] = value
+        self.assertEqual(set(listed), expected_names - {"SHA256SUMS.txt"})
+        self.assertEqual(len(listed), len(checksums))
+        verification = json.loads((assets / "verification.json").read_text(encoding="utf-8"))
+        self.assertEqual([mode["fixture"] for mode in verification["modes"]], ["zh-Hant", "zh-TW"])
+        local = str(self.root)
+        for path in assets.iterdir():
+            if path.suffix in (".json", ".txt"):
+                text = path.read_text(encoding="utf-8")
+                with self.subTest(asset=path.name):
+                    self.assertNotIn(local, text)
+                    self.assertNotIn(json.dumps(local)[1:-1], text)
         self.assertEqual((assets / source.name).read_bytes(), source.read_bytes())
         self.assertEqual((assets / portable.name).read_bytes(), portable.read_bytes())
         public_manifest = json.loads((assets / "release-manifest.json").read_text(encoding="utf-8"))
