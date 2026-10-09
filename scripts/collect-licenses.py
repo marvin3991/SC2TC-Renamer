@@ -7,6 +7,14 @@ import shutil
 import subprocess
 
 
+# Font licence texts shipped beside the fonts that epaint_default_fonts embeds with
+# include_bytes!; their names do not start with LICENSE, so list them explicitly.
+FONT_LICENSE_NAMES = ('OFL.TXT', 'UFL.TXT', 'HACK-REGULAR.TXT', 'EMOJI-ICON-FONT-MIT-LICENSE.TXT')
+EMBEDDED_FONT_PACKAGE = 'epaint_default_fonts'
+EMBEDDED_FONT_LICENSES = ('fonts/Hack-Regular.txt', 'fonts/emoji-icon-font-mit-license.txt',
+                          'fonts/OFL.txt', 'fonts/UFL.txt')
+
+
 def same_license_text(left, right):
     # Git may check out license text with CRLF on Windows; wording must still match.
     return left.replace(b'\r\n', b'\n') == right.replace(b'\r\n', b'\n')
@@ -35,7 +43,7 @@ for package in sorted(metadata['packages'], key=lambda p:(p['name'],p['version']
         if not file.is_file():
             continue
         name = file.name.upper()
-        if not (name.startswith(('LICENSE','LICENCE','COPYING','NOTICE')) or name in ('OFL.TXT','UFL.TXT')):
+        if not (name.startswith(('LICENSE','LICENCE','COPYING','NOTICE')) or name in FONT_LICENSE_NAMES):
             continue
         if file.suffix.lower() in ('.rs','.png','.ttf','.otf'):
             continue
@@ -48,16 +56,20 @@ for package in sorted(metadata['packages'], key=lambda p:(p['name'],p['version']
         else:
             shutil.copyfile(file, output)
         found.append(str(output.relative_to(root)).replace('\\','/'))
-    inventory.append({'name':package['name'],'version':package['version'],'license':package.get('license'),'files':found})
+    # Sorted so the committed inventory does not depend on directory enumeration order.
+    inventory.append({'name':package['name'],'version':package['version'],'license':package.get('license'),'files':sorted(found)})
 fallbacks = {
     'clipboard-win':'clipboard-win', 'gl_generator':'gl-rs', 'khronos_api':'gl-rs', 'profiling':'profiling',
     'zune-core':'zune-image','zune-jpeg':'zune-image',
-    **{name:'egui' for name in ('ecolor','eframe','egui','egui-winit','egui_glow','emath','epaint')}
+    **{name:'egui' for name in ('ecolor','eframe','egui','egui-winit','egui_glow','emath','epaint','epaint_default_fonts')}
 }
 for package in inventory:
-    if not package['files'] and package['name'] in fallbacks:
+    if package['name'] in fallbacks:
+        # Crates without their own copy of the workspace licence get the upstream text;
+        # crates that ship only part of it (font licences) keep theirs and gain the rest.
         directory = root / 'licenses' / 'upstream' / fallbacks[package['name']]
-        package['files'] = [str(file.relative_to(root)).replace('\\','/') for file in directory.glob('*') if file.is_file()]
+        upstream = [str(file.relative_to(root)).replace('\\','/') for file in directory.glob('*') if file.is_file()]
+        package['files'] = sorted(set(package['files']) | set(upstream))
 
 zhconv_source = pathlib.Path(zhconv_package['manifest_path']).parent
 mediawiki_source = zhconv_source / 'data' / 'ZhConversion.php'
@@ -95,5 +107,11 @@ zhconv_inventory['files'].append('licenses/mediawiki/LICENSE-GPL-2.0.txt')
 missing = [package['name'] for package in inventory if not package['files']]
 if missing:
     raise RuntimeError('Missing license text for locked dependencies: ' + ', '.join(missing))
+for package in inventory:
+    if package['name'] == EMBEDDED_FONT_PACKAGE:
+        prefix = 'licenses/rust/' + package['name'] + '-' + package['version'] + '/'
+        absent = [name for name in EMBEDDED_FONT_LICENSES if prefix + name not in package['files']]
+        if absent:
+            raise RuntimeError('Embedded font licenses are missing: ' + ', '.join(absent))
 (root / 'licenses' / 'rust-inventory.json').write_text(json.dumps(inventory,ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps({'packages':len(inventory),'license_files':sum(len(p['files']) for p in inventory),'without_license_files':missing,'mediawiki_table_sha256':table_sha256},ensure_ascii=False))

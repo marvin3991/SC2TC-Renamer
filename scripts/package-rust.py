@@ -14,12 +14,19 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE_FILES = (
     'Cargo.toml', 'Cargo.lock', 'build.rs', 'build.ps1', 'build-rust.ps1',
-    'README.md', 'LICENSE', 'COPYING', 'NOTICE', 'THIRD_PARTY_NOTICES.md',
+    'README.md', 'CHANGELOG.md', 'LICENSE', 'COPYING', 'NOTICE', 'THIRD_PARTY_NOTICES.md',
     '.cargo/config.toml', '.gitattributes', 'scripts/collect-licenses.py', 'scripts/package-rust.py',
     'scripts/release-assets.py', '.github/workflows/release.yml',
-    'tests/test_release.py',
+    'tests/test_release.py', 'tests/test_package.py',
 )
-SOURCE_DIRECTORIES = ('src', 'assets', 'licenses', 'docs', 'vendor/mediawiki')
+# examples/prepare_icon.rs generates assets/app.ico from assets/logo-v2.png.
+SOURCE_DIRECTORIES = ('src', 'assets', 'licenses', 'docs', 'examples', 'vendor/mediawiki')
+# File-manager metadata listed in .gitignore; a local snapshot must not ship it.
+OS_METADATA_NAMES = ('thumbs.db', 'desktop.ini', '.ds_store')
+OS_METADATA_PREFIXES = ('~$',)
+# Values written by `cargo vendor --versioned-dirs vendor/rust`.
+VENDORED_SOURCE_NAME = 'vendored-sources'
+VENDORED_DIRECTORY = 'vendor/rust'
 GITHUB_WARNING_BYTES = 50 * 1024 * 1024
 RUST_TARGET = 'x86_64-pc-windows-msvc'
 
@@ -27,6 +34,28 @@ RUST_TARGET = 'x86_64-pc-windows-msvc'
 def digest(path):
     with path.open('rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+def is_os_metadata(path):
+    name = path.name.casefold()
+    return name in OS_METADATA_NAMES or name.startswith(OS_METADATA_PREFIXES)
+
+
+def require_vendored_configuration(configuration):
+    """Fail unless Cargo is routed to vendor/rust, so the source ZIP rebuilds offline."""
+    try:
+        settings = tomllib.loads(configuration.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError('Cannot read Cargo configuration: ' + str(configuration)) from error
+    sources = settings.get('source')
+    sources = sources if isinstance(sources, dict) else {}
+    crates_io = sources.get('crates-io')
+    vendored = sources.get(VENDORED_SOURCE_NAME)
+    if (not isinstance(crates_io, dict) or crates_io.get('replace-with') != VENDORED_SOURCE_NAME
+            or not isinstance(vendored, dict) or vendored.get('directory') != VENDORED_DIRECTORY):
+        raise RuntimeError('vendor/rust exists but ' + str(configuration) + ' does not replace crates-io with '
+                           + VENDORED_SOURCE_NAME + ' at ' + VENDORED_DIRECTORY
+                           + '; remove the pre-vendored directory or add the cargo vendor configuration.')
 
 
 def source_files():
@@ -41,6 +70,8 @@ def source_files():
             raise RuntimeError('Required source is missing or is a symlink: ' + str(path))
         if path.name.startswith('.env') or path.suffix.lower() in ('.exe', '.log'):
             raise RuntimeError('Unexpected private or binary input: ' + str(path))
+        if is_os_metadata(path):
+            raise RuntimeError('Unexpected file-manager metadata; remove it before packaging: ' + str(path))
     return sorted(files)
 
 
@@ -97,6 +128,8 @@ def main():
             raise RuntimeError('Unexpected cargo vendor configuration.')
         configuration = snapshot / '.cargo' / 'config.toml'
         configuration.write_text(configuration.read_text(encoding='utf-8') + '\n' + vendor_configuration, encoding='utf-8')
+    # A pre-vendored tree is only usable offline when the shipped configuration points at it.
+    require_vendored_configuration(snapshot / '.cargo' / 'config.toml')
     print(json.dumps({'stage': 'vendor', 'directory': str(destination)}, ensure_ascii=False), flush=True)
 
     run([sys.executable, 'scripts/collect-licenses.py'], snapshot, destination / 'collect-licenses.log')
