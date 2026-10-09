@@ -22,7 +22,7 @@ jobs:
         shell: pwsh
         run: |
           chcp 65001 > $null
-          python -m unittest discover -s tests -p test_release.py -v
+          python -m unittest discover -s tests -p 'test_*.py' -v
           if ($LASTEXITCODE -ne 0) { throw 'Release tool checks failed.' }
       - name: Install Rust with format and lint tools
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
@@ -39,6 +39,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Rust lint failed.' }
       - name: Test Rust core, UI events and dictionary updates
         shell: pwsh
+        env:
+          # FAT／reparse tests fail instead of skipping when they cannot run.
+          SC2TC_REQUIRE_PRIVILEGED_TESTS: '1'
         run: |
           chcp 65001 > $null
           cargo test --locked -- --test-threads=1
@@ -47,6 +50,10 @@ jobs:
         run: |
           chcp 65001 > $null
           python scripts/collect-licenses.py
+          if ($LASTEXITCODE -ne 0) { throw 'License inventory collection failed.' }
+          $changed = git status --porcelain -- licenses
+          if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
+          if ($changed) { Write-Output $changed; throw 'licenses/ is out of date; run scripts/collect-licenses.py and commit the result.' }
       - name: Verify Rust standalone file operations
         shell: pwsh
         run: |

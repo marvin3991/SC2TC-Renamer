@@ -8,40 +8,99 @@ use serde_json::json;
 use std::{
     collections::BTreeSet,
     fs,
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, Once,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
-fn fixture() -> PathBuf {
+// Win32 named mutex ownership is per thread, so tests that take the operation
+// lock (journal::apply, journal::undo, native::OperationLock) contend with each
+// other when libtest runs them on parallel threads. The lock name must stay
+// compatible with earlier releases, so the tests serialise themselves instead.
+static OPERATION_LOCK_SERIAL: Mutex<()> = Mutex::new(());
+static DICTIONARY_STORE: Once = Once::new();
+const LOCK_CONTENTION: &str = "另一個視窗正在";
+
+/// Points `Store::standard()` at an empty store under `work/` so conversions
+/// use the embedded table and never read the real %LOCALAPPDATA% settings.
+fn isolate_dictionary_store() {
+    DICTIONARY_STORE.call_once(|| {
+        sc2tc_renamer::updater::Store::override_standard_root(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("work/core_rust-dictionary-store"),
+        )
+        .unwrap();
+    });
+}
+
+/// Synthetic test directory removed when the test passes; a failing test
+/// keeps it under `work/rust-tests` for inspection.
+struct Fixture(PathBuf);
+impl std::ops::Deref for Fixture {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl AsRef<Path> for Fixture {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+fn fixture() -> Fixture {
+    isolate_dictionary_store();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("work/rust-tests")
         .join(Uuid::new_v4().to_string());
     fs::create_dir_all(&path).unwrap();
-    path
+    Fixture(path)
 }
-fn file(root: &std::path::Path, name: &str) -> PathBuf {
+/// Asserts that an operation was refused for the expected reason, not because
+/// another test or window held the operation lock.
+fn rejected<T>(result: anyhow::Result<T>, needle: &str) {
+    let message = match result {
+        Ok(_) => panic!("預期失敗（{needle}），但執行成功"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(message.contains(needle), "預期含「{needle}」：{message}");
+    assert!(
+        !message.contains(LOCK_CONTENTION),
+        "失敗原因是取鎖衝突：{message}"
+    );
+}
+fn file(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"synthetic document bytes\0\xff").unwrap();
     path
 }
-fn snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+/// Relative paths with file contents; directories (including empty ones) are
+/// recorded with `None`.
+fn snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     let mut output = vec![];
     let mut pending = vec![root.to_owned()];
     while let Some(path) = pending.pop() {
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             if path.is_dir() {
+                output.push((relative, None));
                 pending.push(path)
             } else {
-                output.push((
-                    path.strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    fs::read(path).unwrap(),
-                ));
+                output.push((relative, Some(fs::read(path).unwrap())));
             }
         }
     }
@@ -54,6 +113,7 @@ fn plan(root: &std::path::Path) -> engine::Plan {
 
 #[test]
 fn mediawiki_traditional_conversion() {
+    isolate_dictionary_store();
     let converter = Converter::new().unwrap();
     assert_eq!(
         converter.convert("软件 数据库 文件夹 头发 发展").unwrap(),
@@ -68,13 +128,15 @@ fn mediawiki_traditional_conversion() {
 
 #[test]
 fn branded_storage_is_separate_and_both_history_locations_are_protected() {
+    isolate_dictionary_store();
     let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
     let history = local.join("SC2TC-Renamer/history");
     let legacy_history = local.join("OpenCCRenamer/history");
     assert_eq!(engine::history_root().unwrap(), history);
+    // The tests redirect the dictionary store away from %LOCALAPPDATA%.
     assert_eq!(
         sc2tc_renamer::updater::Store::standard().unwrap().root,
-        local.join("SC2TC-Renamer/mediawiki-dictionaries")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("work/core_rust-dictionary-store")
     );
     let plan = plan(&fixture());
     for protected in [history, legacy_history] {
@@ -88,6 +150,9 @@ fn operation_lock_remains_compatible_with_previous_versions() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (acquired_tx, acquired_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let previous_version = std::thread::spawn(move || {
@@ -119,7 +184,9 @@ fn operation_lock_remains_compatible_with_previous_versions() {
         assert!(signalled);
     });
     acquired_rx.recv_timeout(HANDSHAKE_TIMEOUT).unwrap();
-    let blocked = native::OperationLock::acquire().is_err();
+    let blocked = native::OperationLock::acquire()
+        .err()
+        .is_some_and(|error| format!("{error:#}").contains(native::OPERATION_BUSY));
     release_tx.send(()).unwrap();
     previous_version.join().unwrap();
     assert!(
@@ -132,6 +199,7 @@ fn operation_lock_remains_compatible_with_previous_versions() {
 #[test]
 fn mediawiki_names_mixed_scripts_and_second_pass_remain_stable() {
     use sc2tc_renamer::converter::Mode;
+    isolate_dictionary_store();
     let names = [
         ("岳飞.txt", "岳飛.txt"),
         ("岳飛.txt", "岳飛.txt"),
@@ -162,6 +230,9 @@ fn mediawiki_names_mixed_scripts_and_second_pass_remain_stable() {
 #[test]
 fn renamed_person_names_are_unchanged_on_rescan_and_restore_exactly() {
     use sc2tc_renamer::converter::Mode;
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (mode, mixed_target) in [
         (Mode::ZhHant, "岳飛的軟件資料.TXT"),
         (Mode::ZhTw, "岳飛的軟體資料.TXT"),
@@ -207,6 +278,9 @@ fn renamed_person_names_are_unchanged_on_rescan_and_restore_exactly() {
 
 #[test]
 fn old_schema_two_previews_only_allow_recovery() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for mode in ["s2tw.json", "s2twp.json"] {
         let base = fixture();
         let root = base.join("old-history");
@@ -248,6 +322,7 @@ fn old_schema_two_previews_only_allow_recovery() {
 }
 #[test]
 fn selectable_taiwan_mode_changes_terms_and_persists_mode() {
+    isolate_dictionary_store();
     let converter = Converter::with_mode(sc2tc_renamer::converter::Mode::ZhTw).unwrap();
     assert_eq!(
         converter.convert("软件 数据库 鼠标").unwrap(),
@@ -256,7 +331,7 @@ fn selectable_taiwan_mode_changes_terms_and_persists_mode() {
     let base = fixture();
     file(&base, "软件说明.txt");
     let plan = engine::make_plan_with_mode(
-        &[base],
+        &[base.to_path_buf()],
         sc2tc_renamer::converter::Mode::ZhTw,
         &AtomicBool::new(false),
         &|_| {},
@@ -264,22 +339,30 @@ fn selectable_taiwan_mode_changes_terms_and_persists_mode() {
     .unwrap();
     assert_eq!(plan.mode, "zh-TW.json");
     assert_eq!(plan.rows[0].new, "軟體說明.txt");
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     assert_eq!(journal.load().unwrap().mode, "zh-TW.json");
 }
 #[test]
 fn actual_nested_rename_and_recovery() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let root = base.join("文件");
     fs::create_dir(&root).unwrap();
     file(&root, "简体目录/第二层文件夹/软件资料.docx");
     file(&root, "数据备份.tar.gz");
+    fs::create_dir(root.join("简体空目录")).unwrap();
+    fs::create_dir(root.join("简体目录/第二层文件夹/空白文件夹")).unwrap();
     let before = snapshot(&root);
     let plan = plan(&root);
     let journal = Journal::create(&base.join("history"), &plan).unwrap();
     let count = journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
     assert!(root.join("簡體目錄/第二層文件夾/軟件資料.docx").exists());
     assert!(root.join("數據備份.tar.gz").exists());
+    assert!(root.join("簡體空目錄").is_dir());
+    assert!(root.join("簡體目錄/第二層文件夾/空白文件夾").is_dir());
     assert_eq!(
         journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap(),
         count
@@ -289,10 +372,16 @@ fn actual_nested_rename_and_recovery() {
         journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap(),
         0
     );
-    assert!(journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).is_err());
+    rejected(
+        journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}),
+        "這份預覽已執行過",
+    );
 }
 #[test]
 fn collision_files_never_replaced() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let root = base.join("files");
     fs::create_dir(&root).unwrap();
@@ -318,25 +407,38 @@ fn collision_files_never_replaced() {
 }
 #[test]
 fn selected_file_only_does_not_convert_siblings() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let source = file(&base, "报告.txt");
     let sibling = file(&base, "软件.txt");
+    let before = snapshot(&base);
     let plan = engine::make_plan(&[source], &AtomicBool::new(false), &|_| {}).unwrap();
     assert_eq!(plan.rows.len(), 1);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
     assert!(base.join("報告.txt").exists());
     assert!(sibling.exists());
     journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
+    assert_eq!(snapshot(&base), before);
 }
 #[test]
 fn preview_change_stops_before_any_rename() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let source = file(&base, "报告.txt");
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     fs::write(&source, b"changed after preview").unwrap();
-    assert!(journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).is_err());
+    rejected(
+        journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}),
+        "預覽後範圍已變動，請重新掃描產生新的預覽",
+    );
     assert!(source.exists());
     assert!(
         !journal
@@ -377,10 +479,14 @@ fn rename_buffer_boundaries_preserve_exact_unicode_names() {
 }
 #[test]
 fn intent_without_done_is_reconciled_and_restored() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let source = file(&base, "报告.txt");
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     let row = plan
         .rows
         .iter()
@@ -399,12 +505,16 @@ fn intent_without_done_is_reconciled_and_restored() {
 }
 #[test]
 fn cancel_after_first_operation_remains_recoverable() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     file(&base, "报告.txt");
     file(&base, "软件.txt");
     let before = snapshot(&base);
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     let cancel = AtomicBool::new(false);
     let mut_seen = std::sync::atomic::AtomicUsize::new(0);
     let progress = |message: String| {
@@ -412,7 +522,10 @@ fn cancel_after_first_operation_remains_recoverable() {
             cancel.store(true, Ordering::Relaxed);
         }
     };
-    assert!(journal::apply(&plan, &journal, &cancel, &progress).is_err());
+    rejected(
+        journal::apply(&plan, &journal, &cancel, &progress),
+        "已停止；完成 1 個改名，共 2 個",
+    );
     journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
     assert_eq!(snapshot(&base), before);
 }
@@ -433,24 +546,31 @@ fn duplicate_and_overlapping_scopes() {
     let child = base.join("child");
     fs::create_dir(&child).unwrap();
     assert_eq!(
-        engine::normalise(&[base.clone(), base.clone()])
+        engine::normalise(&[base.to_path_buf(), base.to_path_buf()])
             .unwrap()
             .len(),
         1
     );
-    assert!(engine::normalise(&[base, child]).is_err());
+    assert!(engine::normalise(&[base.to_path_buf(), child]).is_err());
     assert!(engine::normalise(&[]).is_err());
 }
 #[test]
 fn changed_original_name_blocks_undo() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     file(&base, "报告.txt");
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
     file(&base, "报告.txt");
     let before = snapshot(&base);
-    assert!(journal::undo(&journal, &AtomicBool::new(false), &|_| {}).is_err());
+    rejected(
+        journal::undo(&journal, &AtomicBool::new(false), &|_| {}),
+        "範圍內有與本次改名無關的項目變動，無法自動復原",
+    );
     assert_eq!(snapshot(&base), before);
 }
 #[test]
@@ -486,10 +606,14 @@ fn changed_scan_issues_report_path_code_and_reason_without_relaxing_checks() {
 #[test]
 fn locked_file_stops_without_replacing_then_recovers() {
     use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*};
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let source = file(&base, "报告.txt");
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     let wide = native::wide(source.as_os_str());
     let handle = unsafe {
         CreateFileW(
@@ -507,7 +631,7 @@ fn locked_file_stops_without_replacing_then_recovers() {
     unsafe {
         CloseHandle(handle);
     }
-    assert!(result.is_err());
+    rejected(result, "已停止；完成 0 個改名，共 1 個");
     assert!(source.exists());
     assert_eq!(
         journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap(),
@@ -517,9 +641,13 @@ fn locked_file_stops_without_replacing_then_recovers() {
 #[test]
 fn hidden_child_protects_parent_but_readable_sibling_converts() {
     use windows_sys::Win32::Storage::FileSystem::*;
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let hidden = file(&base, "简体目录/隐藏.txt");
     file(&base, "简体目录/报告.txt");
+    let before = snapshot(&base);
     assert_ne!(
         unsafe {
             SetFileAttributesW(
@@ -538,20 +666,26 @@ fn hidden_child_protects_parent_but_readable_sibling_converts() {
             .status,
         Status::Blocked
     );
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
     assert!(hidden.exists());
     assert!(base.join("简体目录/報告.txt").exists());
     journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
+    assert_eq!(snapshot(&base), before);
 }
 #[test]
 fn interrupted_undo_and_truncated_tail_are_resumable() {
     use std::io::Write;
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     file(&base, "简体目录/报告.txt");
     let before = snapshot(&base);
     let plan = plan(&base);
-    let journal = Journal::create(&fixture(), &plan).unwrap();
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
     journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
     let (_, actions) = journal::prepare_undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
     let action = &actions[0];
@@ -644,6 +778,9 @@ fn schema_one_journal(base: &std::path::Path, value: &serde_json::Value) -> Jour
 
 #[test]
 fn schema_one_history_is_recovered_without_the_old_runtime() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let root = base.join("legacy");
     fs::create_dir(&root).unwrap();
@@ -655,7 +792,10 @@ fn schema_one_history_is_recovered_without_the_old_runtime() {
     let plan = journal.load().unwrap();
     assert!(plan.legacy);
     assert_eq!(plan.dictionary_version, "舊版紀錄");
-    assert!(journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).is_err());
+    rejected(
+        journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}),
+        "這是舊版紀錄，只能復原",
+    );
     let mut rows: Vec<_> = plan
         .rows
         .iter()
@@ -727,11 +867,38 @@ fn schema_one_large_file_ids_and_nanosecond_timestamps_remain_exact() {
         identity.modified_ticks,
         native::metadata(&source).unwrap().identity.modified_ticks
     );
-    assert!(journal::prepare_undo(&journal, &AtomicBool::new(false), &|_| {}).is_err());
+    // Record a completed rename of the folder only, so recovery reaches the
+    // identity check of the file whose recorded ID cannot match the disk.
+    let folder = loaded
+        .rows
+        .iter()
+        .find(|r| r.kind == engine::Kind::Dir && r.status == Status::Ready)
+        .unwrap();
+    let folder_path = Path::new(&folder.path);
+    journal.append("apply_start", json!({})).unwrap();
+    journal
+        .append("rename_intent", json!({"id":folder.id}))
+        .unwrap();
+    native::rename_no_replace(
+        folder_path,
+        &folder_path.with_file_name(&folder.new),
+        &folder.identity,
+    )
+    .unwrap();
+    journal
+        .append("rename_done", json!({"id":folder.id}))
+        .unwrap();
+    rejected(
+        journal::prepare_undo(&journal, &AtomicBool::new(false), &|_| {}),
+        "範圍已有新增、移除、修改或替換的項目",
+    );
 }
 
 #[test]
 fn schema_one_invalid_identity_or_path_stops_before_recovery() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     let root = base.join("legacy");
     fs::create_dir(&root).unwrap();
@@ -753,66 +920,129 @@ fn schema_one_invalid_identity_or_path_stops_before_recovery() {
         } else {
             file_record["identity"][FILE_ID_FIELD] = json!("not-an-integer");
         }
-        let journal = schema_one_journal(&fixture(), &broken);
-        assert!(journal.load().is_err());
-        assert!(journal::undo(&journal, &AtomicBool::new(false), &|_| {}).is_err());
+        let history = fixture();
+        let journal = schema_one_journal(&history, &broken);
+        let reason = if invalid_path {
+            "舊版相對路徑不合法"
+        } else {
+            // The schema-1 inode is parsed with `u128::from_str`; its
+            // `ParseIntError` text is the only reason in the error chain.
+            "invalid digit found in string"
+        };
+        rejected(journal.load(), reason);
+        rejected(
+            journal::undo(&journal, &AtomicBool::new(false), &|_| {}),
+            reason,
+        );
         assert_eq!(snapshot(&root), before);
     }
 }
+/// Temporary SUBST drive mapping that is removed when the guard is dropped,
+/// including when an assertion panics while the mapping is in use.
+struct SubstGuard {
+    drive: String,
+    mapped: bool,
+}
+impl SubstGuard {
+    fn map(target: &Path) -> Self {
+        const LETTERS: &str = "ZYXWVUTSRQPONMLKJIHGF";
+        let occupied = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        let letter = LETTERS
+            .chars()
+            .find(|&c| occupied & (1 << (c as u32 - 'A' as u32)) == 0)
+            .expect("F–Z 沒有可用的磁碟代號");
+        let drive = format!("{letter}:");
+        let created = std::process::Command::new("subst.exe")
+            .arg(&drive)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(created.status.success());
+        Self {
+            drive,
+            mapped: true,
+        }
+    }
+    /// Removes the mapping and reports whether `subst /D` succeeded.
+    fn unmap(&mut self) -> bool {
+        self.mapped = false;
+        std::process::Command::new("subst.exe")
+            .args([&self.drive, "/D"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+}
+impl Drop for SubstGuard {
+    fn drop(&mut self) {
+        if self.mapped {
+            let _ = self.unmap();
+        }
+    }
+}
+fn dos_device(drive: &str) -> Option<String> {
+    let mut buffer = vec![0u16; native::MAX_PATH_UNITS + 1];
+    let length = unsafe {
+        windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW(
+            native::wide(std::ffi::OsStr::new(drive)).as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    (length != 0)
+        .then(|| String::from_utf16_lossy(&buffer[..buffer.iter().position(|c| *c == 0).unwrap()]))
+}
 #[test]
 fn isolated_volume_root_supports_top_level_and_nested_names() {
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let base = fixture();
     file(&base, "简体目录/报告.txt");
     file(&base, "软件.txt");
     let before = snapshot(&base);
-    const LETTERS: &str = "ZYXWVUTSRQPONMLKJIHGF";
-    let occupied = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
-    let letter = LETTERS
-        .chars()
-        .find(|&c| occupied & (1 << (c as u32 - 'A' as u32)) == 0)
-        .unwrap();
-    let drive = format!("{letter}:");
-    let created = std::process::Command::new("subst.exe")
-        .arg(&drive)
-        .arg(&base)
-        .output()
-        .unwrap();
-    assert!(created.status.success());
-    let volume = PathBuf::from(format!("{drive}\\"));
-    let result = std::panic::catch_unwind(|| {
-        let plan = plan(&volume);
-        let journal = Journal::create(&fixture(), &plan).unwrap();
-        journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
-        assert!(volume.join("簡體目錄/報告.txt").exists());
-        assert!(volume.join("軟件.txt").exists());
-        journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
-        assert_eq!(snapshot(&base), before);
-    });
-    let mut buffer = vec![0u16; native::MAX_PATH_UNITS + 1];
-    assert_ne!(
-        unsafe {
-            windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW(
-                native::wide(std::ffi::OsStr::new(&drive)).as_ptr(),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-            )
-        },
-        0
-    );
-    let target = String::from_utf16_lossy(&buffer[..buffer.iter().position(|c| *c == 0).unwrap()]);
+    let mut mapping = SubstGuard::map(&base);
+    let volume = PathBuf::from(format!("{}\\", mapping.drive));
+    let plan = plan(&volume);
+    let history = fixture();
+    let journal = Journal::create(&history, &plan).unwrap();
+    journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {}).unwrap();
+    assert!(volume.join("簡體目錄/報告.txt").exists());
+    assert!(volume.join("軟件.txt").exists());
+    journal::undo(&journal, &AtomicBool::new(false), &|_| {}).unwrap();
+    assert_eq!(snapshot(&base), before);
+    let target = dos_device(&mapping.drive).unwrap();
     assert_eq!(
         native::key(std::path::Path::new(target.strip_prefix("\\??\\").unwrap())),
         native::key(&base)
     );
-    assert!(
-        std::process::Command::new("subst.exe")
-            .args([&drive, "/D"])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    if let Err(error) = result {
-        std::panic::resume_unwind(error);
-    }
+    assert!(mapping.unmap());
+}
+#[test]
+fn test_guards_clean_up_after_success_and_keep_failures_for_inspection() {
+    // Choosing a free drive letter is not atomic; share the serial lock with
+    // the other SUBST test.
+    let _serial = OPERATION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let removed = {
+        let fixture = fixture();
+        file(&fixture, "简体目录/报告.txt");
+        fixture.to_path_buf()
+    };
+    assert!(!removed.exists());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let failed = std::thread::spawn(move || {
+        let fixture = fixture();
+        let mapping = SubstGuard::map(&fixture);
+        sender
+            .send((fixture.to_path_buf(), mapping.drive.clone()))
+            .unwrap();
+        panic!("刻意觸發 panic，驗證測試清理行為");
+    })
+    .join();
+    assert!(failed.is_err());
+    let (kept, drive) = receiver.recv().unwrap();
+    assert!(dos_device(&drive).is_none(), "SUBST 映射未移除：{drive}");
+    assert!(kept.exists(), "失敗測試的夾具應保留供除錯");
+    fs::remove_dir_all(kept).unwrap();
 }

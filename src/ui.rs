@@ -1,5 +1,5 @@
 use crate::{
-    converter::Mode,
+    converter::{ENGINE_VERSION, Mode},
     engine::{self, Kind, Plan, Scope, Status},
     journal::{self, Journal, UndoAction},
     native,
@@ -10,10 +10,12 @@ use eframe::egui::{
     self, Align, Color32, Context, FontFamily, Id, Layout, Rect, RichText, Sense, Stroke, Vec2,
 };
 use std::{
-    collections::BTreeSet,
+    any::Any,
+    collections::{BTreeSet, HashMap},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
     time::Duration,
 };
 
@@ -33,6 +35,15 @@ const ACCENT: Color32 = Color32::from_rgb(38, 99, 235);
 const BORDER: Color32 = Color32::from_rgb(222, 229, 239);
 const GREEN: Color32 = Color32::from_rgb(14, 126, 92);
 const ORANGE: Color32 = Color32::from_rgb(185, 90, 12);
+/// Chinese UI fonts tried in order. Both belong to the base font set in
+/// Microsoft's "Windows 11 font list"; egui's bundled fonts have no CJK glyphs.
+const CHINESE_FONTS: [&str; 2] = ["msjh.ttc", "msyh.ttc"];
+/// Shown in ASCII because without a CJK font Chinese text renders as boxes.
+const FONT_MISSING: &str =
+    "Chinese UI font not found (Fonts\\msjh.ttc or msyh.ttc); Chinese text may not display.";
+const ADD_REFUSED: &str = "正在處理，請完成目前步驟後再加入路徑。";
+const STOPPING: &str = "正在安全停止，完成目前項目後可關閉視窗。";
+const WORKER_LOST: &str = "背景工作異常結束：沒有回傳結果。";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Filter {
@@ -75,7 +86,8 @@ enum Completed {
     Finished(usize),
     DictionaryChecked(Release, bool),
     DictionaryStaged(Bundle),
-    DictionaryChanged(String),
+    DictionaryActivated(String),
+    DictionaryReset,
 }
 #[derive(Clone, Debug)]
 struct Line {
@@ -123,13 +135,16 @@ pub struct App {
     filtered: Vec<usize>,
     filter: Filter,
     search: String,
-    path_input: String,
+    pub path_input: String,
     last_selected: Option<usize>,
     job: Option<Job>,
     receiver: Option<mpsc::Receiver<std::result::Result<Completed, String>>>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<String>>,
     status: String,
+    /// Shown in the footer while a job runs, when the progress text would
+    /// otherwise hide why an input was refused or the window stays open.
+    notice: Option<String>,
     message: Option<(String, String)>,
     confirm: bool,
     backup_ack: bool,
@@ -139,31 +154,40 @@ pub struct App {
     dictionary_release: Option<Release>,
     dictionary_candidate: Option<Bundle>,
     dictionary_version: String,
+    fonts_loaded: bool,
 }
 
-pub fn configure(ctx: &Context) {
+/// Installs fonts and style. Returns whether a Chinese UI font was loaded.
+pub fn configure(ctx: &Context) -> bool {
     let mut fonts = egui::FontDefinitions::default();
     let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()));
-    for (name, file) in [("system-ui", "segoeui.ttf"), ("chinese-ui", "msjh.ttc")] {
-        if let Ok(bytes) = std::fs::read(windows.join("Fonts").join(file)) {
+    let directory = windows.join("Fonts");
+    if let Ok(bytes) = std::fs::read(directory.join("segoeui.ttf")) {
+        fonts.font_data.insert(
+            "system-ui".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "system-ui".to_owned());
+    }
+    let chinese = CHINESE_FONTS
+        .iter()
+        .find_map(|file| std::fs::read(directory.join(file)).ok());
+    let loaded = chinese.is_some();
+    if let Some(bytes) = chinese {
+        fonts.font_data.insert(
+            "chinese-ui".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts
-                .font_data
-                .insert(name.to_owned(), egui::FontData::from_owned(bytes).into());
-            if name == "system-ui" {
-                fonts
-                    .families
-                    .entry(FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, name.to_owned());
-            } else {
-                for family in [FontFamily::Proportional, FontFamily::Monospace] {
-                    fonts
-                        .families
-                        .entry(family)
-                        .or_default()
-                        .push(name.to_owned());
-                }
-            }
+                .families
+                .entry(family)
+                .or_default()
+                .push("chinese-ui".to_owned());
         }
     }
     ctx.set_fonts(fonts);
@@ -193,6 +217,19 @@ pub fn configure(ctx: &Context) {
         .text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(25.0));
     ctx.set_style(style);
+    loaded
+}
+
+/// The progress text stays readable even if a worker panicked while holding it.
+fn lock_text(text: &Mutex<String>) -> MutexGuard<'_, String> {
+    text.lock().unwrap_or_else(PoisonError::into_inner)
+}
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("未知原因")
 }
 
 fn card() -> egui::Frame {
@@ -208,7 +245,13 @@ fn button(text: &str) -> egui::Button<'_> {
 
 impl App {
     pub fn new(ctx: &Context, history: PathBuf) -> Self {
-        configure(ctx);
+        let fonts_loaded = configure(ctx);
+        let dictionary = Store::standard().and_then(|s| s.current());
+        let status = match &dictionary {
+            _ if !fonts_loaded => FONT_MISSING.to_owned(),
+            Err(error) => format!("轉換表狀態無法讀取：{error:#}"),
+            Ok(_) => "加入檔案或資料夾，先預覽，再確認改名。".to_owned(),
+        };
         let image = image::load_from_memory(include_bytes!("../assets/logo-v2.png"))
             .expect("embedded logo")
             .into_rgba8();
@@ -241,7 +284,8 @@ impl App {
             receiver: None,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(String::new())),
-            status: "加入檔案或資料夾，先預覽，再確認改名。".to_owned(),
+            status,
+            notice: None,
             message: None,
             confirm: false,
             backup_ack: false,
@@ -250,14 +294,49 @@ impl App {
             dictionary_dialog: false,
             dictionary_release: None,
             dictionary_candidate: None,
-            dictionary_version: Store::standard()
-                .and_then(|s| s.current())
+            dictionary_version: dictionary
                 .map(|x| x.0)
                 .unwrap_or_else(|_| "狀態待查核".to_owned()),
+            fonts_loaded,
         }
     }
     pub fn busy(&self) -> bool {
         self.job.is_some()
+    }
+    pub fn fonts_loaded(&self) -> bool {
+        self.fonts_loaded
+    }
+    #[doc(hidden)]
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+    #[doc(hidden)]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+    #[doc(hidden)]
+    pub fn message_text(&self) -> Option<&str> {
+        self.message.as_ref().map(|(_, text)| text.as_str())
+    }
+    #[doc(hidden)]
+    pub fn spawn_failing_job_for_test(&mut self, ctx: &Context) {
+        self.spawn(ctx, Job::Add, |_, _| panic!("synthetic worker failure"));
+    }
+    #[doc(hidden)]
+    pub fn spawn_waiting_job_for_test(&mut self, ctx: &Context, gate: mpsc::Receiver<()>) {
+        self.spawn(ctx, Job::Add, move |_, _| {
+            let _ = gate.recv();
+            Ok(Completed::Add(vec![], vec![]))
+        });
+    }
+    #[doc(hidden)]
+    pub fn finish_for_test(&mut self, undo: bool, count: usize) {
+        let job = if undo { Job::Undo } else { Job::Apply };
+        self.complete(Some(job), Ok(Completed::Finished(count)));
+    }
+    #[doc(hidden)]
+    pub fn dictionary_reset_for_test(&mut self) {
+        self.complete(Some(Job::ResetDictionary), Ok(Completed::DictionaryReset));
     }
     pub fn mode_changed(&mut self, mode: Mode) {
         if self.mode != mode {
@@ -331,10 +410,8 @@ impl App {
             return;
         }
         self.cancel.store(false, Ordering::Relaxed);
-        self.progress
-            .lock()
-            .unwrap()
-            .clone_from(&"處理中…".to_owned());
+        self.notice = None;
+        lock_text(&self.progress).clone_from(&"處理中…".to_owned());
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.job = Some(job);
@@ -342,18 +419,32 @@ impl App {
         let progress = self.progress.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = task(cancel, progress).map_err(|e| format!("{e:#}"));
+            // A panic must still report back, or the window would stay busy
+            // and refuse to close.
+            let result = catch_unwind(AssertUnwindSafe(|| task(cancel, progress)))
+                .unwrap_or_else(|payload| {
+                    Err(anyhow::anyhow!(
+                        "背景工作異常結束：{}",
+                        panic_text(payload.as_ref())
+                    ))
+                })
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
-    pub fn add_paths(&mut self, ctx: &Context, paths: Vec<PathBuf>) {
+    /// Returns false when the paths were refused because another step is in progress.
+    pub fn add_paths(&mut self, ctx: &Context, paths: Vec<PathBuf>) -> bool {
         if paths.is_empty() {
-            return;
+            return true;
         }
         if self.busy() || self.confirm || self.message.is_some() || self.dictionary_dialog {
-            self.status = "正在處理，請完成目前步驟後再加入路徑。".to_owned();
-            return;
+            self.status = ADD_REFUSED.to_owned();
+            // While the window waits for a safe stop, keep that notice visible.
+            if !(self.busy() && self.cancel.load(Ordering::Relaxed)) {
+                self.notice = Some(ADD_REFUSED.to_owned());
+            }
+            return false;
         }
         self.spawn(ctx, Job::Add, move |cancel, progress| {
             let mut added = vec![];
@@ -368,6 +459,15 @@ impl App {
             }
             Ok(Completed::Add(added, errors))
         });
+        true
+    }
+    /// Adds the typed path; the text is kept when the request is refused.
+    #[doc(hidden)]
+    pub fn submit_path_input(&mut self, ctx: &Context) {
+        let path = PathBuf::from(self.path_input.trim().trim_matches('"'));
+        if self.add_paths(ctx, vec![path]) {
+            self.path_input.clear();
+        }
     }
     fn scan(&mut self, ctx: &Context) {
         let paths = self
@@ -430,107 +530,164 @@ impl App {
         );
     }
     fn poll(&mut self) {
-        let messages = self
-            .receiver
-            .as_ref()
-            .map(|rx| rx.try_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for result in messages {
-            let job = self.job.take();
-            self.receiver = None;
-            match result {
-                Ok(Completed::Add(scopes, errors)) => {
-                    self.accept_scopes(scopes);
-                    if !errors.is_empty() {
-                        self.message = Some(("部分路徑未加入".to_owned(), errors.join("\n\n")));
-                    }
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+        // Each job sends exactly one result. A worker that ends without
+        // sending one is reported instead of leaving the window busy.
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(WORKER_LOST.to_owned()),
+        };
+        let job = self.job.take();
+        self.receiver = None;
+        self.notice = None;
+        self.complete(job, result);
+    }
+    /// Re-resolves the scopes after a rename or undo, completed or stopped
+    /// part-way: a file scope may now carry either its old or its new name.
+    /// Returns the file scopes that no longer exist; they are removed.
+    fn remap_scopes(&mut self) -> Vec<String> {
+        let Some(plan) = self.plan.clone() else {
+            return vec![];
+        };
+        let ready = plan
+            .rows
+            .iter()
+            .filter(|r| r.status == Status::Ready)
+            .map(|r| r.id)
+            .collect();
+        let forward = engine::changes(&plan, &ready);
+        let reverse = ready
+            .iter()
+            .map(|&id| {
+                let row = &plan.rows[id];
+                (
+                    native::key(&engine::mapped(&row.path, &forward)),
+                    row.old.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut kept = vec![];
+        let mut missing = vec![];
+        for scope in std::mem::take(&mut self.scopes) {
+            let candidates = [
+                PathBuf::from(&scope.path),
+                engine::mapped(&scope.path, &forward),
+                engine::mapped(&scope.path, &reverse),
+            ];
+            match candidates.iter().find_map(|path| engine::scope(path).ok()) {
+                Some(updated) => kept.push(updated),
+                None if scope.kind == Kind::File => missing.push(scope.path),
+                None => kept.push(scope),
+            }
+        }
+        self.scopes = kept;
+        if !missing.is_empty() {
+            self.selected.clear();
+            self.last_selected = None;
+        }
+        missing
+    }
+    fn report_missing_scopes(&mut self, missing: &[String]) {
+        if !missing.is_empty() {
+            self.status = format!(
+                "{} 範圍 {} 已不存在，請重新加入。",
+                self.status,
+                missing.join("、")
+            );
+        }
+    }
+    fn complete(&mut self, job: Option<Job>, result: std::result::Result<Completed, String>) {
+        match result {
+            Ok(Completed::Add(scopes, errors)) => {
+                self.accept_scopes(scopes);
+                if !errors.is_empty() {
+                    self.message = Some(("部分路徑未加入".to_owned(), errors.join("\n\n")));
                 }
-                Ok(Completed::Preview(plan, journal)) => self.set_preview(plan, journal),
-                Ok(Completed::UndoPreview(plan, journal, actions)) => {
-                    self.set_undo(plan, journal, actions)
-                }
-                Ok(Completed::Finished(count)) => {
-                    self.applied = true;
-                    self.status = format!(
-                        "{}完成，已核對 {count} 個項目。",
-                        if matches!(job, Some(Job::Undo)) {
-                            "復原"
-                        } else {
-                            "改名"
-                        }
-                    );
-                    for line in &mut self.lines {
-                        if line.executable {
-                            line.status = "完成".to_owned();
-                            line.executable = false;
-                            line.tone = GREEN;
-                        }
-                    }
-                    self.refilter();
-                    if let Some(plan) = &self.plan {
-                        let mapping = if matches!(job, Some(Job::Apply)) {
-                            engine::changes(
-                                plan,
-                                &plan
-                                    .rows
-                                    .iter()
-                                    .filter(|r| r.status == Status::Ready)
-                                    .map(|r| r.id)
-                                    .collect(),
-                            )
-                        } else {
-                            std::collections::HashMap::new()
-                        };
-                        for scope in &mut self.scopes {
-                            let path = engine::mapped(&scope.path, &mapping);
-                            if let Ok(updated) = engine::scope(&path) {
-                                *scope = updated;
-                            }
-                        }
-                    }
-                }
-                Ok(Completed::DictionaryChecked(release, available)) => {
-                    self.status = if available {
-                        "有 MediaWiki 轉換表更新，可先下載驗證。".to_owned()
+            }
+            Ok(Completed::Preview(plan, journal)) => self.set_preview(plan, journal),
+            Ok(Completed::UndoPreview(plan, journal, actions)) => {
+                self.set_undo(plan, journal, actions)
+            }
+            Ok(Completed::Finished(count)) => {
+                self.applied = true;
+                self.status = format!(
+                    "{}完成，已核對 {count} 個項目。",
+                    if matches!(job, Some(Job::Undo)) {
+                        "復原"
                     } else {
-                        "目前已是 zhconv 正式版本快照；可重新下載驗證。".to_owned()
-                    };
-                    self.dictionary_release = Some(release);
-                    self.dictionary_dialog = true;
-                }
-                Ok(Completed::DictionaryStaged(bundle)) => {
-                    self.dictionary_candidate = Some(bundle);
-                    self.dictionary_dialog = true;
-                    self.status = "下載與相容性驗證完成，尚未套用。".to_owned();
-                }
-                Ok(Completed::DictionaryChanged(version)) => {
-                    self.dictionary_version = version;
-                    self.dictionary_release = None;
-                    self.dictionary_candidate = None;
-                    self.invalidate();
-                    self.status =
-                        "MediaWiki 轉換表已套用，舊設定保留為備份；請重新掃描。".to_owned();
-                }
-                Err(error) => {
-                    if matches!(job, Some(Job::Apply | Job::Undo)) {
-                        self.applied = true;
+                        "改名"
                     }
-                    self.status = error.lines().next().unwrap_or("已停止").to_owned();
-                    self.message = Some(("作業已停止".to_owned(), error.clone()));
-                    if std::fs::create_dir_all(&self.history).is_ok() {
-                        use std::io::Write;
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(self.history.join("errors.jsonl"))
-                        {
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::json!({"time":chrono::Utc::now().to_rfc3339(),"error":error})
-                            );
-                            let _ = file.sync_all();
-                        }
+                );
+                for line in &mut self.lines {
+                    if line.executable {
+                        line.status = "完成".to_owned();
+                        line.executable = false;
+                        line.tone = GREEN;
+                    }
+                }
+                self.refilter();
+                let missing = self.remap_scopes();
+                self.report_missing_scopes(&missing);
+            }
+            Ok(Completed::DictionaryChecked(release, available)) => {
+                self.status = if available {
+                    "有 MediaWiki 轉換表更新，可先下載驗證。".to_owned()
+                } else {
+                    "目前已是 zhconv 正式版本快照；可重新下載驗證。".to_owned()
+                };
+                self.dictionary_release = Some(release);
+                self.dictionary_dialog = true;
+            }
+            Ok(Completed::DictionaryStaged(bundle)) => {
+                self.dictionary_candidate = Some(bundle);
+                self.dictionary_dialog = true;
+                self.status = "下載與相容性驗證完成，尚未套用。".to_owned();
+            }
+            Ok(Completed::DictionaryActivated(version)) => {
+                self.dictionary_version = version;
+                self.dictionary_release = None;
+                self.dictionary_candidate = None;
+                self.invalidate();
+                self.status = "MediaWiki 轉換表已套用，舊設定保留為備份；請重新掃描。".to_owned();
+            }
+            Ok(Completed::DictionaryReset) => {
+                self.dictionary_version = ENGINE_VERSION.to_owned();
+                self.dictionary_release = None;
+                self.dictionary_candidate = None;
+                self.invalidate();
+                self.status =
+                    format!("已回復為內附轉換表（zhconv {ENGINE_VERSION}）；請重新掃描。");
+            }
+            Err(error) => {
+                self.status = error.lines().next().unwrap_or("已停止").to_owned();
+                // Show the store's actual state after a failed switch.
+                if matches!(job, Some(Job::ActivateDictionary | Job::ResetDictionary))
+                    && let Ok((version, _)) = Store::standard().and_then(|s| s.current())
+                {
+                    self.dictionary_version = version;
+                }
+                if matches!(job, Some(Job::Apply | Job::Undo)) {
+                    self.applied = true;
+                    let missing = self.remap_scopes();
+                    self.report_missing_scopes(&missing);
+                }
+                self.message = Some(("作業已停止".to_owned(), error.clone()));
+                if std::fs::create_dir_all(&self.history).is_ok() {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(self.history.join("errors.jsonl"))
+                    {
+                        let _ = writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({"time":chrono::Utc::now().to_rfc3339(),"error":error})
+                        );
+                        let _ = file.sync_all();
                     }
                 }
             }
@@ -595,11 +752,9 @@ impl App {
         self.refilter();
     }
     pub fn set_undo(&mut self, plan: Plan, journal: Journal, actions: Vec<UndoAction>) {
+        // The record's mode is only displayed; the user's selection stays for the next scan.
         self.view = ViewMode::Undo;
         self.applied = false;
-        if let Ok(mode) = Mode::parse(&plan.mode) {
-            self.mode = mode;
-        }
         self.journal = Some(journal);
         self.lines = actions
             .into_iter()
@@ -618,16 +773,18 @@ impl App {
         self.refilter();
     }
     pub fn displayed_mode(&self) -> String {
-        if let Some(plan) = &self.plan
-            && (plan.legacy || Mode::parse(&plan.mode).is_err())
-        {
-            return "舊版紀錄 · 僅供復原".to_owned();
+        let mut mode = self.mode;
+        if let Some(plan) = &self.plan {
+            match Mode::parse(&plan.mode) {
+                Ok(recorded) if !plan.legacy => {
+                    if self.view == ViewMode::Undo {
+                        mode = recorded;
+                    }
+                }
+                _ => return "舊版紀錄 · 僅供復原".to_owned(),
+            }
         }
-        format!(
-            "MediaWiki · {} · {}",
-            self.mode.name(),
-            self.mode.description()
-        )
+        format!("MediaWiki · {} · {}", mode.name(), mode.description())
     }
     pub fn can_execute(&self) -> bool {
         self.lines.iter().any(|r| r.executable)
@@ -703,7 +860,8 @@ impl App {
         if ctx.input(|i| i.viewport().close_requested()) && self.busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.cancel.store(true, Ordering::Relaxed);
-            self.status = "正在安全停止，完成目前項目後可關閉視窗。".to_owned();
+            self.status = STOPPING.to_owned();
+            self.notice = Some(STOPPING.to_owned());
         }
         // Reserve the bottom actions BEFORE any content. They cannot be pushed below the viewport.
         self.footer(ctx);
@@ -712,7 +870,7 @@ impl App {
         self.preview(ctx);
         self.dictionary_window(ctx);
         self.dialogs(ctx);
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        if !self.busy() && ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 Id::new("drop_hover"),
@@ -749,7 +907,9 @@ impl App {
                         }));
                     }
                     let status = if self.busy() {
-                        self.progress.lock().unwrap().clone()
+                        self.notice
+                            .clone()
+                            .unwrap_or_else(|| lock_text(&self.progress).clone())
                     } else {
                         self.status.clone()
                     };
@@ -880,7 +1040,8 @@ impl App {
                         self.add_paths(ctx, paths);
                     }
                 });
-                let input = ui.add(
+                let input = ui.add_enabled(
+                    !self.busy(),
                     egui::TextEdit::singleline(&mut self.path_input)
                         .id(Id::new("path_input"))
                         .hint_text("貼上路徑，按 Enter 加入")
@@ -891,9 +1052,7 @@ impl App {
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter))
                     && !self.path_input.trim().is_empty()
                 {
-                    let path = PathBuf::from(self.path_input.trim().trim_matches('"'));
-                    self.path_input.clear();
-                    self.add_paths(ctx, vec![path]);
+                    self.submit_path_input(ctx);
                 }
                 egui::Frame::new()
                     .fill(Color32::from_rgb(238, 244, 255))
@@ -1295,7 +1454,7 @@ impl App {
                 if self.busy() {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(self.progress.lock().unwrap().clone());
+                        ui.label(lock_text(&self.progress).clone());
                     });
                 }
                 if let Some(release) = &self.dictionary_release {
@@ -1397,15 +1556,13 @@ impl App {
         if activate && let Some(bundle) = self.dictionary_candidate.clone() {
             self.spawn(ctx, Job::ActivateDictionary, move |_, _| {
                 Store::standard()?.activate(&bundle)?;
-                Ok(Completed::DictionaryChanged(bundle.version))
+                Ok(Completed::DictionaryActivated(bundle.version))
             });
         }
         if reset {
             self.spawn(ctx, Job::ResetDictionary, |_, _| {
                 Store::standard()?.reset_embedded()?;
-                Ok(Completed::DictionaryChanged(
-                    crate::converter::ENGINE_VERSION.to_owned(),
-                ))
+                Ok(Completed::DictionaryReset)
             });
         }
     }

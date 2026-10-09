@@ -2,16 +2,56 @@ use crate::{
     converter::{Converter, ENGINE_VERSION, Mode},
     engine::{self, Status},
     journal::{self, Journal},
+    updater,
 };
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
+
+/// Command-line flags that take an output path as the next argument.
+pub const CLI_FLAGS: [&str; 4] = [
+    "--self-test",
+    "--self-test-update",
+    "--check-dictionary-update",
+    "--ui-self-check",
+];
+/// Allowed difference, in points, between a requested and a measured window
+/// size: the size is set and read back in whole physical pixels, and each of
+/// the two roundings can be off by up to one pixel (at most one point when
+/// pixels_per_point >= 1).
+pub const SIZE_TOLERANCE: f32 = 2.0;
+
+pub fn is_cli_flag(arg: &OsString) -> bool {
+    CLI_FLAGS.iter().any(|flag| arg == flag)
+}
+/// Where a command-line run reports its failure: next to the output path that
+/// follows the flag. `args` excludes the program name. Ordinary GUI launches,
+/// including files dropped on the executable, return `None`.
+pub fn failure_report_path(args: &[OsString]) -> Option<PathBuf> {
+    if !is_cli_flag(args.first()?) {
+        return None;
+    }
+    let output = PathBuf::from(args.get(1)?);
+    // Append rather than replace an extension: `work\update.json` reports to
+    // `work\update.json.failure.json`, as docs/BUILD.md states.
+    let mut name = output.file_name()?.to_os_string();
+    name.push(".failure.json");
+    Some(output.with_file_name(name))
+}
+/// Whether a measured `[width, height]` matches the expected one within `tolerance`.
+pub fn size_matches(actual: [f32; 2], expected: [f32; 2], tolerance: f32) -> bool {
+    actual
+        .iter()
+        .zip(expected)
+        .all(|(actual, expected)| (actual - expected).abs() <= tolerance)
+}
 
 pub fn snapshots(root: &Path) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
@@ -37,10 +77,14 @@ pub fn snapshots(root: &Path) -> Result<BTreeMap<String, String>> {
 }
 pub fn self_test(directory: &Path) -> Result<Value> {
     fs::create_dir(directory)?;
+    // Same isolation as `--self-test-update`: the check must exercise the
+    // embedded table, never the user's applied dictionary.
+    updater::Store::override_standard_root(directory.join("dictionary-store"))?;
     let cancel = AtomicBool::new(false);
     let mut modes = vec![];
     let mut total_renamed = 0;
     let mut total_restored = 0;
+    let mut dictionary = None;
     for mode in [Mode::ZhHant, Mode::ZhTw] {
         let root = directory.join(mode.name());
         fs::create_dir(&root)?;
@@ -99,6 +143,16 @@ pub fn self_test(directory: &Path) -> Result<Value> {
                 == 1,
             "collision not flagged"
         );
+        ensure!(
+            plan.dictionary_hash == updater::EMBEDDED_CRATE_SHA256,
+            "{} plan did not use the embedded dictionary: {}",
+            mode.name(),
+            plan.dictionary_hash
+        );
+        dictionary = Some((
+            plan.dictionary_version.clone(),
+            plan.dictionary_hash.clone(),
+        ));
         let journal = Journal::create(&directory.join("history"), &plan)?;
         let renamed = journal::apply(&plan, &journal, &cancel, &|_| {})?;
         let after = snapshots(&root)?;
@@ -119,7 +173,8 @@ pub fn self_test(directory: &Path) -> Result<Value> {
         total_restored += restored;
         modes.push(json!({"mode":mode.name(),"renamed":renamed,"restored":restored,"second_pass_unchanged":true,"samples":samples,"fixture":root}));
     }
-    let result = json!({"version":engine::APP_VERSION,"engine":"MediaWiki","engine_version":ENGINE_VERSION,"rust_native":true,"modes":modes,"renamed":total_renamed,"restored":total_restored,"sha256_unchanged":true,"original_names_restored":true,"conflicts_preserved":true});
+    let (dictionary_version, dictionary_hash) = dictionary.unwrap_or_default();
+    let result = json!({"version":engine::APP_VERSION,"engine":"MediaWiki","engine_version":ENGINE_VERSION,"dictionary_version":dictionary_version,"dictionary_hash":dictionary_hash,"rust_native":true,"modes":modes,"renamed":total_renamed,"restored":total_restored,"sha256_unchanged":true,"original_names_restored":true,"conflicts_preserved":true});
     write_json(&directory.join("verification.json"), &result)?;
     Ok(result)
 }

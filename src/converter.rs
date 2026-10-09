@@ -95,8 +95,7 @@ impl Converter {
     pub fn from_config(path: &Path) -> Result<Self> {
         let info = native::metadata(path)?;
         ensure!(
-            info.attributes & native::REPARSE_POINT == 0
-                && info.identity.size.is_some_and(|n| n <= MAX_CONFIG_BYTES),
+            !info.link && info.identity.size.is_some_and(|n| n <= MAX_CONFIG_BYTES),
             "MediaWiki 模式設定不是有效的實體檔案"
         );
         let mut bytes = Vec::new();
@@ -273,9 +272,11 @@ impl SourceParser<'_> {
                 self.offset += first.len_utf8();
                 continue;
             }
-            if remaining.starts_with("/*") {
-                let end = remaining.find("*/").context("MediaWiki 註解未結束")?;
-                self.offset += end + 2;
+            if let Some(body) = remaining.strip_prefix("/*") {
+                // Like PHP, search for the terminator after the opening `/*`, so `/*/`
+                // does not close itself.
+                let end = body.find("*/").context("MediaWiki 註解未結束")?;
+                self.offset += "/*".len() + end + "*/".len();
                 continue;
             }
             if remaining.starts_with("//") || remaining.starts_with('#') {

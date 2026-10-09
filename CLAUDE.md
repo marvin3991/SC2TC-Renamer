@@ -9,6 +9,7 @@
 - Git 設定只使用 repo local 範圍；未經使用者明確授權，不 force-push 或改寫已推送歷史。
 - Rust 驗證：`cargo fmt --all --check`、`cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --locked -- --test-threads=1`。
 - Python 僅供打包、發布及授權收集腳本使用，使用標準函式庫；產品執行檔不依賴 Python。
+- 修改 `Cargo.toml` 或 `Cargo.lock` 後，必須重新執行 `scripts/collect-licenses.py` 並提交 `licenses/` 的變更；CI 會比對，過期即失敗。
 - 引擎使用 zhconv-rs 的 MediaWiki 轉換表；啟用功能僅限 `mediawiki-hant`、`mediawiki-tw`。
 - 轉換表更新只追蹤 crates.io 的 zhconv 正式版本，驗證官方雜湊與相容性後由使用者確認套用；保留舊設定，不自動更新。
 - 既有名稱備份保留原始紀錄位置及逐筆狀態；只能供復原，新改名必須重新掃描。

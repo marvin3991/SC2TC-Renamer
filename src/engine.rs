@@ -16,6 +16,13 @@ use std::{
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SCHEMA: u32 = 2;
 const ERROR_SAMPLE_LIMIT: usize = 3;
+/// Only short ASCII extensions are kept verbatim; a dot followed by Chinese
+/// text is part of the name and is converted with it.
+const MAX_EXTENSION_CHARS: usize = 10;
+pub const ISSUE_CODE_CASE_COLLISION: &str = "case-collision";
+/// Protection reason recorded for links; v1.0.0 wrote it for every reparse
+/// point, including cloud placeholders that are ordinary items now.
+const LINK_REASON: &str = "連結／接合點：不進入、不改名";
 const EXCLUDED_NAMES: &[&str] = &[
     ".git",
     ".venv",
@@ -93,6 +100,11 @@ pub struct Plan {
     pub dictionary_hash: String,
 }
 
+/// Identities observed after renames, keyed by row id. FAT family file
+/// systems assign a new file ID on every rename, so verification and recovery
+/// use the latest recorded identity instead of the one captured at scan time.
+pub type Identities = HashMap<usize, Identity>;
+
 pub fn cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         bail!("已停止；沒有繼續處理其他項目。");
@@ -109,7 +121,7 @@ pub fn history_root() -> Result<PathBuf> {
 pub fn scope(path: &Path) -> Result<Scope> {
     let path = native::absolute(path)?;
     let info = native::metadata(&path)?;
-    if info.attributes & native::REPARSE_POINT != 0 {
+    if info.link {
         bail!("不能加入符號連結或接合點：{}", path.display());
     }
     let kind = if info.directory {
@@ -122,12 +134,19 @@ pub fn scope(path: &Path) -> Result<Scope> {
     } else {
         path.parent().context("檔案沒有上層資料夾")?.to_owned()
     };
+    let anchor_info = native::metadata(&anchor)?;
+    if anchor_info.link {
+        bail!(
+            "檔案所在的資料夾是符號連結或接合點，不能加入：{}",
+            anchor.display()
+        );
+    }
     let canonical = fs::canonicalize(&path).context("無法確認路徑範圍")?;
     Ok(Scope {
         path: native::text(&path)?,
         kind,
         anchor: native::text(&anchor)?,
-        anchor_id: native::metadata(&anchor)?.identity,
+        anchor_id: anchor_info.identity,
         canonical: native::text(&canonical)?,
     })
 }
@@ -173,15 +192,46 @@ fn issue(path: &Path, error: &anyhow::Error) -> Issue {
     }
 }
 
-fn protection(path: &Path, info: &native::Metadata, exclusions: &[String], legacy: bool) -> String {
-    if info.attributes & native::REPARSE_POINT != 0 {
-        "連結／接合點：不進入、不改名".to_owned()
+/// Tool record locations resolved by path and by directory identity, so an
+/// alias (SUBST drive, junction, 8.3 short name) cannot bypass the exclusion.
+struct Exclusions {
+    paths: Vec<String>,
+    ids: Vec<(u64, u128)>,
+}
+impl Exclusions {
+    fn resolve(paths: &[String]) -> Self {
+        let ids = paths
+            .iter()
+            .filter_map(|p| native::metadata(Path::new(p)).ok())
+            .filter(|m| m.directory && !m.link)
+            .map(|m| (m.identity.volume, m.identity.file_id))
+            .collect();
+        Self {
+            paths: paths.to_vec(),
+            ids,
+        }
+    }
+    fn matches(&self, path: &Path, info: &native::Metadata) -> bool {
+        self.paths
+            .iter()
+            .any(|x| native::contains(Path::new(x), path))
+            || self
+                .ids
+                .contains(&(info.identity.volume, info.identity.file_id))
+    }
+}
+
+fn protection(
+    path: &Path,
+    info: &native::Metadata,
+    exclusions: &Exclusions,
+    legacy: bool,
+) -> String {
+    if info.link {
+        LINK_REASON.to_owned()
     } else if info.attributes & native::HIDDEN_SYSTEM != 0 {
         "隱藏或系統項目：保留".to_owned()
-    } else if exclusions
-        .iter()
-        .any(|x| native::contains(Path::new(x), path))
-    {
+    } else if exclusions.matches(path, info) {
         "工具紀錄：保留".to_owned()
     } else if path
         .file_name()
@@ -228,15 +278,20 @@ pub fn inventory(
     progress: &dyn Fn(String),
     legacy: bool,
 ) -> Result<(Vec<Record>, Vec<Issue>)> {
-    let mut records = BTreeMap::new();
+    let exclusions = Exclusions::resolve(exclusions);
+    let mut records: BTreeMap<String, Record> = BTreeMap::new();
     let mut issues = vec![];
     for scope in scopes {
         cancelled(cancel)?;
         let anchor = mapped(&scope.anchor, current);
         let anchor_info = native::metadata(&anchor)?;
-        if anchor_info.attributes & native::REPARSE_POINT != 0
-            || anchor_info.identity != scope.anchor_id
-        {
+        if anchor_info.link {
+            bail!(
+                "選取範圍的上層資料夾已變成符號連結或接合點，停止：{}",
+                anchor.display()
+            );
+        }
+        if anchor_info.identity != scope.anchor_id {
             bail!("選取範圍的上層資料夾已被替換，停止：{}", anchor.display());
         }
         records.insert(
@@ -259,30 +314,48 @@ pub fn inventory(
                     continue;
                 }
             };
-            let kind = if info.attributes & native::REPARSE_POINT != 0 {
+            let text = match native::text(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    issues.push(issue(&path, &error));
+                    continue;
+                }
+            };
+            let kind = if info.link {
                 Kind::Link
             } else if info.directory {
                 Kind::Dir
             } else {
                 Kind::File
             };
-            let protected =
-                if selected && kind == Kind::Dir && info.attributes & native::REPARSE_POINT == 0 {
-                    String::new()
-                } else {
-                    protection(&path, &info, exclusions, legacy)
-                };
+            let mut protected = if selected && kind == Kind::Dir {
+                String::new()
+            } else {
+                protection(&path, &info, &exclusions, legacy)
+            };
+            let record_key = native::key(&path);
+            if let Some(previous) = records.get(&record_key)
+                && previous.identity != info.identity
+            {
+                // Two items whose names differ only by case cannot both be tracked.
+                issues.push(Issue {
+                    path: text.clone(),
+                    code: ISSUE_CODE_CASE_COLLISION.to_owned(),
+                    reason: "同一資料夾內有僅大小寫不同的名稱並存，無法安全處理".to_owned(),
+                });
+                protected = "名稱僅大小寫不同的項目並存：保留".to_owned();
+            }
             records.insert(
-                native::key(&path),
+                record_key,
                 Record {
-                    path: native::text(&path)?,
+                    path: text,
                     kind,
                     identity: info.identity,
                     protected: protected.clone(),
                 },
             );
             if kind == Kind::Dir && protected.is_empty() {
-                let entries = match fs::read_dir(&path) {
+                let entries = match fs::read_dir(native::verbatim(&path)) {
                     Ok(entries) => entries,
                     Err(error) => {
                         issues.push(issue(&path, &error.into()));
@@ -292,7 +365,7 @@ pub fn inventory(
                 let mut children = vec![];
                 for entry in entries {
                     match entry {
-                        Ok(entry) => children.push(entry.path()),
+                        Ok(entry) => children.push(path.join(entry.file_name())),
                         Err(error) => issues.push(issue(&path, &error.into())),
                     }
                 }
@@ -302,7 +375,26 @@ pub fn inventory(
         }
     }
     issues.sort_by(|a, b| (&a.path, &a.code).cmp(&(&b.path, &b.code)));
+    issues.dedup();
     Ok((records.into_values().collect(), issues))
+}
+
+/// Returns the extension kept verbatim (with its dot), or an empty string when
+/// the text after the last dot is not a short ASCII extension.
+pub fn preserved_extension(name: &str) -> &str {
+    let Some(extension) = Path::new(name).extension().and_then(OsStr::to_str) else {
+        return "";
+    };
+    let count = extension.chars().count();
+    if (1..=MAX_EXTENSION_CHARS).contains(&count)
+        && extension
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        &name[name.len() - extension.len() - 1..]
+    } else {
+        ""
+    }
 }
 
 pub fn make_plan(
@@ -319,19 +411,37 @@ pub fn make_plan_with_mode(
     progress: &dyn Fn(String),
 ) -> Result<Plan> {
     let scopes = normalise(paths)?;
+    let history = history_root()?;
+    // The record directory must exist before scanning so that it is excluded
+    // by identity even when the scope reaches it through an alias.
+    fs::create_dir_all(&history).context("無法建立工具紀錄目錄")?;
     let legacy_history =
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("找不到本機應用程式資料目錄")?)
             .join("OpenCCRenamer/history");
-    let exclusions = vec![
-        native::text(&history_root()?)?,
-        native::text(&legacy_history)?,
-    ];
-    if scopes.iter().any(|s| {
-        exclusions
-            .iter()
-            .any(|x| native::contains(Path::new(x), Path::new(&s.path)))
-    }) {
-        bail!("工具的執行紀錄不能列入改名範圍。");
+    let exclusions = vec![native::text(&history)?, native::text(&legacy_history)?];
+    let excluded = Exclusions::resolve(&exclusions);
+    for scope in &scopes {
+        let inside_by_path = excluded.paths.iter().any(|x| {
+            native::contains(Path::new(x), Path::new(&scope.path))
+                || native::contains(Path::new(x), Path::new(&scope.canonical))
+        });
+        // The resolved path matters when the scope is an alias (SUBST,
+        // junction) of a folder inside the record directory: the alias itself
+        // has no ancestors there, and its resolved spelling may differ from
+        // the LOCALAPPDATA text (redirected or linked profile folders).
+        let mut ancestors = Path::new(&scope.path)
+            .ancestors()
+            .chain(Path::new(&scope.canonical).ancestors());
+        let inside_by_identity = ancestors.any(|ancestor| {
+            native::metadata(ancestor).is_ok_and(|m| {
+                excluded
+                    .ids
+                    .contains(&(m.identity.volume, m.identity.file_id))
+            })
+        });
+        if inside_by_path || inside_by_identity {
+            bail!("工具的執行紀錄不能列入改名範圍。");
+        }
     }
     let (records, issues) = inventory(
         &scopes,
@@ -355,6 +465,11 @@ pub fn make_plan_with_mode(
             blocked_parents.insert(native::key(p));
         }
     }
+    let collision_parents: BTreeSet<String> = issues
+        .iter()
+        .filter(|i| i.code == ISSUE_CODE_CASE_COLLISION)
+        .map(|i| native::key(Path::new(&i.path)))
+        .collect();
     let mut rows = vec![];
     for record in &records {
         cancelled(cancel)?;
@@ -378,15 +493,11 @@ pub fn make_plan_with_mode(
             .context("名稱不是有效的 Unicode")?
             .to_owned();
         let suffix = if record.kind == Kind::File {
-            Path::new(&old)
-                .extension()
-                .and_then(OsStr::to_str)
-                .map(|s| format!(".{s}"))
-                .unwrap_or_default()
+            preserved_extension(&old)
         } else {
-            String::new()
+            ""
         };
-        let new = converter.convert(&old[..old.len() - suffix.len()])? + &suffix;
+        let new = converter.convert(&old[..old.len() - suffix.len()])? + suffix;
         let mut row = Row {
             id: rows.len(),
             path: record.path.clone(),
@@ -397,9 +508,19 @@ pub fn make_plan_with_mode(
             status: Status::Unchanged,
             reason: "名稱不變".to_owned(),
         };
+        let under_collision = path
+            .ancestors()
+            .skip(1)
+            .any(|p| collision_parents.contains(&native::key(p)));
         if !record.protected.is_empty() {
             row.status = Status::Excluded;
             row.reason = record.protected.clone();
+            row.new = old;
+        } else if under_collision {
+            // The parent folder shares its key with another folder; its
+            // children were listed before the collision was detected.
+            row.status = Status::Excluded;
+            row.reason = "上層資料夾名稱僅大小寫不同的項目並存：保留".to_owned();
             row.new = old;
         } else if row.new != row.old {
             row.status = Status::Ready;
@@ -426,8 +547,10 @@ pub fn make_plan_with_mode(
         if row.status != Status::Ready {
             continue;
         }
+        cancelled(cancel)?;
+        progress(format!("檢查同名 · {}", row.path));
         let target = Path::new(&row.path).with_file_name(&row.new);
-        let occupied = match fs::symlink_metadata(&target) {
+        let occupied = match fs::symlink_metadata(native::verbatim(&target)) {
             Ok(_) => native::key(&target) != native::key(Path::new(&row.path)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(_) => {
@@ -455,30 +578,47 @@ pub fn make_plan_with_mode(
         dictionary_version: converter.dictionary_version.clone(),
         dictionary_hash: converter.dictionary_hash.clone(),
     };
+    block_long_paths(&mut plan, cancel)?;
+    validate(&plan)?;
+    Ok(plan)
+}
+
+/// Every item keeps a legal path after all ready renames, including children
+/// of renamed folders that are not renamed themselves.
+fn block_long_paths(plan: &mut Plan, cancel: &AtomicBool) -> Result<()> {
+    const REASON: &str = "轉換後路徑超出 Windows 上限";
     let active = plan
         .rows
         .iter()
         .filter(|r| r.status == Status::Ready)
         .map(|r| r.id)
         .collect();
-    let mapping = changes(&plan, &active);
-    for row in &mut plan.rows {
-        if row.status == Status::Ready
-            && mapped(&row.path, &mapping)
-                .as_os_str()
-                .encode_wide()
-                .count()
-                >= native::MAX_PATH_UNITS
-        {
-            row.status = Status::Blocked;
-            row.reason = "轉換後路徑超出 Windows 上限".to_owned();
+    let mapping = changes(plan, &active);
+    let row_by_key: HashMap<String, usize> = plan
+        .rows
+        .iter()
+        .map(|r| (native::key(Path::new(&r.path)), r.id))
+        .collect();
+    let mut blocked = BTreeSet::new();
+    for record in &plan.records {
+        cancelled(cancel)?;
+        if native::path_units(&mapped(&record.path, &mapping)) < native::MAX_PATH_UNITS {
+            continue;
+        }
+        for ancestor in Path::new(&record.path).ancestors() {
+            if let Some(&id) = row_by_key.get(&native::key(ancestor))
+                && plan.rows[id].status == Status::Ready
+            {
+                blocked.insert(id);
+            }
         }
     }
-    validate(&plan)?;
-    Ok(plan)
+    for id in blocked {
+        plan.rows[id].status = Status::Blocked;
+        plan.rows[id].reason = REASON.to_owned();
+    }
+    Ok(())
 }
-
-use std::os::windows::ffi::OsStrExt;
 
 pub fn is_legacy_mode(mode: &str) -> bool {
     matches!(mode, "s2tw" | "s2tw.json" | "s2twp" | "s2twp.json")
@@ -564,6 +704,18 @@ pub fn verify(
     cancel: &AtomicBool,
     progress: &dyn Fn(String),
 ) -> Result<()> {
+    verify_with(plan, active, &Identities::new(), cancel, progress)
+}
+
+/// Compares the current tree with the plan; `identities` overrides the
+/// scan-time identity of rows whose file ID changed when they were renamed.
+pub fn verify_with(
+    plan: &Plan,
+    active: &BTreeSet<usize>,
+    identities: &Identities,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(String),
+) -> Result<()> {
     let mapping = changes(plan, active);
     let (records, issues) = inventory(
         &plan.scopes,
@@ -573,17 +725,29 @@ pub fn verify(
         progress,
         plan.legacy,
     )?;
-    let expected: BTreeMap<_, _> = plan
+    let overlay: HashMap<String, &Identity> = identities
+        .iter()
+        .filter_map(|(&id, identity)| {
+            plan.rows
+                .get(id)
+                .map(|row| (native::key(Path::new(&row.path)), identity))
+        })
+        .collect();
+    let mut expected: BTreeMap<_, _> = plan
         .records
         .iter()
         .map(|r| {
+            let identity = overlay
+                .get(&native::key(Path::new(&r.path)))
+                .copied()
+                .unwrap_or(&r.identity);
             (
                 native::key(&mapped(&r.path, &mapping)),
-                (r.kind, &r.identity, !r.protected.is_empty()),
+                (r.kind, identity, !r.protected.is_empty()),
             )
         })
         .collect();
-    let actual: BTreeMap<_, _> = records
+    let mut actual: BTreeMap<_, _> = records
         .iter()
         .map(|r| {
             (
@@ -592,6 +756,25 @@ pub fn verify(
             )
         })
         .collect();
+    // Records written by v1.0.0 treated every reparse point as a link and never
+    // listed its children. An item that is a non-surrogate reparse point today
+    // (cloud placeholder) is the same item, so it and anything found below it
+    // are left out of the comparison instead of failing the whole recovery.
+    for record in &plan.records {
+        if record.kind != Kind::Link || record.protected != LINK_REASON {
+            continue;
+        }
+        let current = mapped(&record.path, &mapping);
+        let Ok(info) = native::metadata(&current) else {
+            continue;
+        };
+        if info.link || info.attributes & native::REPARSE_POINT == 0 {
+            continue;
+        }
+        let key = native::key(&current);
+        expected.remove(&key);
+        actual.retain(|k, _| k != &key && !native::contains(Path::new(&key), Path::new(k)));
+    }
     let issue_set = |items: &[Issue]| {
         items
             .iter()
@@ -607,9 +790,7 @@ pub fn verify(
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        bail!(
-            "範圍已有新增、移除、修改或替換的項目，停止。請重新掃描；復原時請保留紀錄查核。\n{sample}"
-        );
+        bail!("範圍已有新增、移除、修改或替換的項目，停止。\n{sample}");
     }
     let expected_issues = issue_set(&plan.issues);
     let current_issues = issue_set(&issues);
@@ -627,22 +808,38 @@ pub fn verify(
             .map(|issue| format!("{} · {} · {}", issue.path, issue.code, issue.reason))
             .collect::<Vec<_>>()
             .join("\n");
-        bail!("掃描問題已變更，停止；請核對路徑與錯誤後重新掃描，復原時保留紀錄。\n{sample}");
+        bail!("掃描問題已變更，停止。\n{sample}");
     }
     Ok(())
 }
 
 pub fn directory_index(plan: &Plan) -> HashMap<String, Identity> {
-    plan.records
+    directory_index_with(plan, &Identities::new())
+}
+
+/// Directory identities keyed by original path, with renamed folders replaced
+/// by the identity recorded after their rename.
+pub fn directory_index_with(plan: &Plan, identities: &Identities) -> HashMap<String, Identity> {
+    let mut index: HashMap<String, Identity> = plan
+        .records
         .iter()
         .filter(|r| r.kind == Kind::Dir)
         .map(|r| (native::key(Path::new(&r.path)), r.identity.clone()))
-        .collect()
+        .collect();
+    for (&id, identity) in identities {
+        if let Some(row) = plan.rows.get(id)
+            && row.kind == Kind::Dir
+        {
+            index.insert(native::key(Path::new(&row.path)), identity.clone());
+        }
+    }
+    index
 }
 
 pub fn move_row(
     plan: &Plan,
     row: &Row,
+    expected: &Identity,
     source: &Path,
     destination: &Path,
     mapping: &HashMap<String, String>,
@@ -664,12 +861,12 @@ pub fn move_row(
         .context("來源缺少上層資料夾")?;
     loop {
         let parent = mapped(&native::text(original_parent)?, mapping);
-        let expected = directories
+        let expected_parent = directories
             .get(&native::key(original_parent))
             .context("名稱備份缺少上層資料夾身分")?;
         let info = native::metadata(&parent)?;
-        if info.attributes & native::REPARSE_POINT != 0 || expected != &info.identity {
-            bail!("上層資料夾已被替換或變成連結，停止。");
+        if info.link || expected_parent != &info.identity {
+            bail!("上層資料夾已被替換或變成連結，停止：{}", parent.display());
         }
         if native::key(original_parent) == native::key(Path::new(&scope.anchor)) {
             if info.identity != scope.anchor_id {
@@ -679,7 +876,7 @@ pub fn move_row(
         }
         original_parent = original_parent.parent().context("路徑超出選取範圍")?;
     }
-    native::rename_no_replace(source, destination, &row.identity)
+    native::rename_no_replace(source, destination, expected)
 }
 
 pub fn save_csv(plan: &Plan, path: &Path) -> Result<()> {
