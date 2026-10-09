@@ -408,8 +408,12 @@
     "version": "0.33.3",
     "license": "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0",
     "files": [
+      "licenses/rust/epaint_default_fonts-0.33.3/fonts/Hack-Regular.txt",
       "licenses/rust/epaint_default_fonts-0.33.3/fonts/OFL.txt",
-      "licenses/rust/epaint_default_fonts-0.33.3/fonts/UFL.txt"
+      "licenses/rust/epaint_default_fonts-0.33.3/fonts/UFL.txt",
+      "licenses/rust/epaint_default_fonts-0.33.3/fonts/emoji-icon-font-mit-license.txt",
+      "licenses/upstream/egui/LICENSE-APACHE",
+      "licenses/upstream/egui/LICENSE-MIT"
     ]
   },
   {
