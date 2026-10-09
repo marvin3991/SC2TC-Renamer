@@ -2,7 +2,7 @@ use crate::{
     converter::{self, Converter, ENGINE_VERSION, Mode},
     native,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -11,7 +11,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{OnceLock, atomic::AtomicBool},
     time::Duration,
 };
 use uuid::Uuid;
@@ -64,16 +64,33 @@ struct State {
     engine_version: String,
     bundle: Option<Bundle>,
 }
+/// Process-wide replacement for the standard store location, used by tests
+/// and self-checks so they never read or write the user's real dictionary state.
+static STANDARD_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
 #[derive(Clone, Debug)]
 pub struct Store {
     pub root: PathBuf,
 }
 impl Store {
     pub fn standard() -> Result<Self> {
+        if let Some(root) = STANDARD_ROOT.get() {
+            return Ok(Self { root: root.clone() });
+        }
         Ok(Self {
             root: PathBuf::from(std::env::var_os("LOCALAPPDATA").context("找不到本機資料目錄")?)
                 .join("SC2TC-Renamer/mediawiki-dictionaries"),
         })
+    }
+    /// Redirects `Store::standard()` for the rest of the process. Setting the
+    /// same path again is accepted; a different path is an error.
+    pub fn override_standard_root(root: PathBuf) -> Result<()> {
+        let root = native::absolute(&root)?;
+        match STANDARD_ROOT.set(root.clone()) {
+            Ok(()) => Ok(()),
+            Err(_) if STANDARD_ROOT.get() == Some(&root) => Ok(()),
+            Err(_) => bail!("字典儲存路徑已在此程序中設定為其他位置"),
+        }
     }
     pub fn active(&self) -> Result<Option<Bundle>> {
         safe_directory_path(&self.root)?;
@@ -308,8 +325,9 @@ fn safe_directory_path(path: &Path) -> Result<()> {
             Ok(_) => {
                 let metadata = native::metadata(ancestor)?;
                 ensure!(
-                    metadata.attributes & native::REPARSE_POINT == 0 && metadata.directory,
-                    "字典儲存路徑包含連結或非資料夾項目"
+                    !metadata.link && metadata.directory,
+                    "字典儲存路徑包含連結或非資料夾項目：{}",
+                    ancestor.display()
                 );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -322,9 +340,9 @@ fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
     safe_directory_path(path.parent().context("字典檔案缺少資料夾")?)?;
     let info = native::metadata(path)?;
     ensure!(
-        info.attributes & native::REPARSE_POINT == 0
-            && info.identity.size.is_some_and(|size| size <= limit),
-        "字典檔案不是實體檔案或超出上限"
+        !info.link && info.identity.size.is_some_and(|size| size <= limit),
+        "字典檔案不是實體檔案或超出上限：{}",
+        path.display()
     );
     let mut data = Vec::new();
     fs::File::open(path)?

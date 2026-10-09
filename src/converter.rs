@@ -95,8 +95,7 @@ impl Converter {
     pub fn from_config(path: &Path) -> Result<Self> {
         let info = native::metadata(path)?;
         ensure!(
-            info.attributes & native::REPARSE_POINT == 0
-                && info.identity.size.is_some_and(|n| n <= MAX_CONFIG_BYTES),
+            !info.link && info.identity.size.is_some_and(|n| n <= MAX_CONFIG_BYTES),
             "MediaWiki 模式設定不是有效的實體檔案"
         );
         let mut bytes = Vec::new();

@@ -1,5 +1,5 @@
 use crate::{
-    engine::{self, Issue, Kind, Plan, Record, Row, Scope, Status},
+    engine::{self, Identities, Issue, Kind, Plan, Record, Row, Scope, Status},
     native::{self, Identity},
 };
 use anyhow::{Context, Result, bail};
@@ -24,6 +24,27 @@ pub struct UndoAction {
     pub source: PathBuf,
     pub target: PathBuf,
 }
+/// Operation state replayed from events.jsonl.
+#[derive(Clone, Debug, Default)]
+pub struct RecoveredState {
+    /// Rows currently carrying their new name.
+    pub active: BTreeSet<usize>,
+    /// Rows in the order their rename was attempted.
+    pub order: Vec<usize>,
+    /// A rename or undo whose completion was never recorded, reconciled
+    /// against the file system.
+    pub pending: Option<usize>,
+    /// Latest identity recorded for each row after a rename or restore.
+    pub identities: Identities,
+}
+struct UndoPlan {
+    plan: Plan,
+    actions: Vec<UndoAction>,
+    state: RecoveredState,
+}
+
+const RESCAN_HINT: &str = "預覽後範圍已變動，請重新掃描產生新的預覽";
+const MANUAL_RESTORE_HINT: &str = "範圍內有與本次改名無關的項目變動，無法自動復原；請移除新增的項目或還原變動後重試，或依 preview.csv 手動復原";
 
 impl Journal {
     pub fn create(base: &Path, plan: &Plan) -> Result<Self> {
@@ -60,14 +81,18 @@ impl Journal {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let raw = fs::read(path)?;
+        let raw = fs::read(&path)?;
         let mut result = vec![];
         let lines: Vec<&[u8]> = raw.split_inclusive(|byte| *byte == b'\n').collect();
         for (index, line) in lines.iter().enumerate() {
             match serde_json::from_slice(line) {
                 Ok(value) => result.push(value),
                 Err(_) if index + 1 == lines.len() && !line.ends_with(b"\n") => break,
-                Err(_) => bail!("執行紀錄損毀，停止自動復原。"),
+                Err(_) => bail!(
+                    "執行紀錄損毀，停止自動復原：{} 第 {} 行",
+                    path.display(),
+                    index + 1
+                ),
             }
         }
         Ok(result)
@@ -111,7 +136,7 @@ impl Journal {
         }
         detail["event"] = json!(event);
         detail["time"] = json!(Utc::now().to_rfc3339());
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         serde_json::to_writer(&mut file, &detail)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -146,56 +171,91 @@ pub fn apply(
     {
         bail!("字典版本已變更，請重新掃描，避免套用舊字典的預覽。");
     }
-    engine::verify(plan, &BTreeSet::new(), cancel, progress)?;
+    engine::verify(plan, &BTreeSet::new(), cancel, progress).context(RESCAN_HINT)?;
     journal.append("apply_start", json!({}))?;
     let mut active = BTreeSet::new();
     let mut mapping = HashMap::new();
-    let directories = engine::directory_index(plan);
+    let mut identities = Identities::new();
+    let mut directories = engine::directory_index(plan);
     let mut rows: Vec<_> = plan
         .rows
         .iter()
         .filter(|r| r.status == Status::Ready)
         .collect();
+    let total = rows.len();
     rows.sort_by_key(|r| {
         (
             std::cmp::Reverse(Path::new(&r.path).components().count()),
             r.id,
         )
     });
-    let result = (|| -> Result<()> {
+    let renamed = (|| -> Result<()> {
         for row in rows {
             engine::cancelled(cancel)?;
             let source = engine::mapped(&row.path, &mapping);
             let target = source.with_file_name(&row.new);
             progress(format!("改名中 · {}", source.display()));
             journal.append("rename_intent",json!({"id":row.id,"source":native::text(&source)?,"target":native::text(&target)?}))?;
-            engine::move_row(plan, row, &source, &target, &mapping, &directories)?;
+            engine::move_row(
+                plan,
+                row,
+                &row.identity,
+                &source,
+                &target,
+                &mapping,
+                &directories,
+            )?;
+            // FAT family volumes assign a new file ID on every rename; keep the
+            // identity the item has now so verification and recovery can find it.
+            let identity = native::metadata(&target)?.identity;
             active.insert(row.id);
             mapping.insert(native::key(Path::new(&row.path)), row.new.clone());
-            journal.append("rename_done", json!({"id":row.id}))?;
+            if row.kind == Kind::Dir {
+                directories.insert(native::key(Path::new(&row.path)), identity.clone());
+            }
+            identities.insert(row.id, identity.clone());
+            journal.append("rename_done", json!({"id":row.id,"identity":identity}))?;
         }
-        engine::verify(plan, &active, &AtomicBool::new(false), progress)?;
         Ok(())
     })();
-    match result {
-        Ok(()) => {
-            journal.append(
-                "apply_end",
-                json!({"status":"complete","count":active.len()}),
-            )?;
-            Ok(active.len())
-        }
-        Err(error) => {
-            let _ = journal.append(
-                "apply_end",
-                json!({"status":"stopped","count":active.len(),"reason":format!("{error:#}")}),
-            );
-            bail!(
-                "已停止；完成 {} 個改名。保留此紀錄，可核對後復原。\n{error:#}",
-                active.len()
-            );
-        }
+    if let Err(error) = renamed {
+        let _ = journal.append(
+            "apply_end",
+            json!({"status":"stopped","count":active.len(),"reason":format!("{error:#}")}),
+        );
+        bail!(
+            "已停止；完成 {} 個改名，共 {total} 個。保留此紀錄，可核對後復原。\n{error:#}",
+            active.len()
+        );
     }
+    if let Err(error) = engine::verify_with(
+        plan,
+        &active,
+        &identities,
+        &AtomicBool::new(false),
+        progress,
+    ) {
+        let _ = journal.append(
+            "apply_end",
+            json!({"status":"completed_unverified","count":active.len(),"reason":format!("{error:#}")}),
+        );
+        bail!(
+            "改名已全部完成（{} 個），但完成後核對發現範圍有其他變動；紀錄已保留，可用於復原。\n{error:#}",
+            active.len()
+        );
+    }
+    journal
+        .append(
+            "apply_end",
+            json!({"status":"complete","count":active.len()}),
+        )
+        .with_context(|| {
+            format!(
+                "改名已全部完成（{} 個），但結束紀錄寫入失敗；紀錄仍可用於復原",
+                active.len()
+            )
+        })?;
+    Ok(active.len())
 }
 
 fn operation_id(event: &Value, plan: &Plan) -> Result<usize> {
@@ -206,12 +266,81 @@ fn operation_id(event: &Value, plan: &Plan) -> Result<usize> {
     Ok(id)
 }
 
-pub fn recover_state(
-    plan: &Plan,
-    journal: &Journal,
-) -> Result<(BTreeSet<usize>, Vec<usize>, Option<usize>)> {
-    let mut active = BTreeSet::new();
-    let mut order = vec![];
+fn recorded_identity(event: &Value) -> Result<Option<Identity>> {
+    if event["identity"].is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_value(event["identity"].clone())
+            .context("執行紀錄的項目身分格式不合法")?,
+    ))
+}
+
+enum Probe {
+    Missing,
+    Matches,
+    Other(native::Metadata),
+}
+fn probe(path: &Path, expected: &Identity) -> Result<Probe> {
+    match native::metadata(path) {
+        Ok(info) if !info.link && info.identity == *expected => Ok(Probe::Matches),
+        Ok(info) => Ok(Probe::Other(info)),
+        Err(error)
+            if error.chain().any(|e| {
+                e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(Probe::Missing)
+        }
+        Err(error) => Err(error),
+    }
+}
+fn describe(probe: &Probe) -> &'static str {
+    match probe {
+        Probe::Missing => "不存在",
+        Probe::Matches => "存在且身分相符",
+        Probe::Other(_) => "存在但身分不符",
+    }
+}
+
+/// Decides whether an interrupted operation moved the item, using the
+/// recorded identity first and, on volumes that renumber items when they are
+/// renamed, the unchanged kind, size and modification time.
+fn reconcile(
+    row: &Row,
+    expected: &Identity,
+    original: &Path,
+    changed: &Path,
+) -> Result<(bool, Option<Identity>)> {
+    let before = probe(original, expected)?;
+    let after = probe(changed, expected)?;
+    let decision = match (&before, &after) {
+        (Probe::Matches, Probe::Missing | Probe::Other(_)) => Some((false, None)),
+        (Probe::Missing | Probe::Other(_), Probe::Matches) => Some((true, None)),
+        (Probe::Missing, Probe::Other(info)) => {
+            let same_kind = info.directory == (row.kind == Kind::Dir);
+            let same_content = info.identity.volume == expected.volume
+                && info.identity.size == expected.size
+                && info.identity.modified_ticks == expected.modified_ticks;
+            (same_kind && same_content).then(|| (true, Some(info.identity.clone())))
+        }
+        _ => None,
+    };
+    decision.with_context(|| {
+        format!(
+            "中斷動作無法唯一核對，停止自動復原。\n原名稱 {}：{}\n新名稱 {}：{}\n請手動確認哪一個名稱是正確的項目，移除或改回另一個後再按復原。",
+            original.display(),
+            describe(&before),
+            changed.display(),
+            describe(&after)
+        )
+    })
+}
+
+pub fn recover_state(plan: &Plan, journal: &Journal) -> Result<RecoveredState> {
+    let mut state = RecoveredState::default();
+    let mut seen = BTreeSet::new();
     let mut pending: Option<(bool, usize)> = None;
     for event in journal.events()? {
         match event["event"].as_str().context("執行紀錄格式不合法")? {
@@ -220,18 +349,21 @@ pub fn recover_state(
                     bail!("有多個未完成動作，停止自動復原。");
                 }
                 let id = operation_id(&event, plan)?;
-                if order.contains(&id) {
+                if !seen.insert(id) {
                     bail!("執行紀錄含重複改名動作。");
                 }
                 pending = Some((false, id));
-                order.push(id);
+                state.order.push(id);
             }
             "rename_done" => {
                 let id = operation_id(&event, plan)?;
                 if pending != Some((false, id)) {
                     bail!("改名紀錄順序不合法。");
                 }
-                active.insert(id);
+                state.active.insert(id);
+                if let Some(identity) = recorded_identity(&event)? {
+                    state.identities.insert(id, identity);
+                }
                 pending = None;
             }
             "undo_intent" => {
@@ -239,7 +371,7 @@ pub fn recover_state(
                     bail!("有未核對的中斷動作，停止復原。");
                 }
                 let id = operation_id(&event, plan)?;
-                if !active.contains(&id) {
+                if !state.active.contains(&id) {
                     bail!("復原項目尚未改名，停止。");
                 }
                 pending = Some((true, id));
@@ -249,7 +381,10 @@ pub fn recover_state(
                 if pending != Some((true, id)) {
                     bail!("復原紀錄順序不合法。");
                 }
-                active.remove(&id);
+                state.active.remove(&id);
+                if let Some(identity) = recorded_identity(&event)? {
+                    state.identities.insert(id, identity);
+                }
                 pending = None;
             }
             "intent_reconciled" => {
@@ -258,9 +393,12 @@ pub fn recover_state(
                     bail!("中斷核對紀錄不合法。");
                 }
                 if event["active"].as_bool().context("中斷核對格式不合法")? {
-                    active.insert(id);
+                    state.active.insert(id);
                 } else {
-                    active.remove(&id);
+                    state.active.remove(&id);
+                }
+                if let Some(identity) = recorded_identity(&event)? {
+                    state.identities.insert(id, identity);
                 }
                 pending = None;
             }
@@ -269,36 +407,58 @@ pub fn recover_state(
     }
     if let Some((_, id)) = pending {
         let row = &plan.rows[id];
-        let mut off = active.clone();
+        let mut off = state.active.clone();
         off.remove(&id);
-        let mut on = active.clone();
+        let mut on = state.active.clone();
         on.insert(id);
         let original = engine::mapped(&row.path, &engine::changes(plan, &off));
         let changed = engine::mapped(&row.path, &engine::changes(plan, &on));
-        let matches =
-            |path: &Path| -> Result<bool> {
-                match native::metadata(path) {
-                    Ok(info) => Ok(info.attributes & native::REPARSE_POINT == 0
-                        && info.identity == row.identity),
-                    Err(error)
-                        if error.chain().any(|e| {
-                            e.downcast_ref::<std::io::Error>()
-                                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                        }) =>
-                    {
-                        Ok(false)
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-        let before = matches(&original)?;
-        let after = matches(&changed)?;
-        if before == after {
-            bail!("中斷動作無法唯一核對；停止自動復原。");
+        let expected = state
+            .identities
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| row.identity.clone());
+        let (renamed, identity) = reconcile(row, &expected, &original, &changed)?;
+        state.active = if renamed { on } else { off };
+        if let Some(identity) = identity {
+            state.identities.insert(id, identity);
         }
-        active = if after { on } else { off };
+        state.pending = Some(id);
     }
-    Ok((active, order, pending.map(|p| p.1)))
+    Ok(state)
+}
+
+fn prepare_undo_state(
+    journal: &Journal,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(String),
+) -> Result<UndoPlan> {
+    let plan = journal.load()?;
+    let state = recover_state(&plan, journal)?;
+    if state.order.is_empty() {
+        bail!("此紀錄只有掃描預覽，未執行改名，沒有可復原的項目；請改選有執行改名的那次紀錄。");
+    }
+    engine::verify_with(&plan, &state.active, &state.identities, cancel, progress)
+        .context(MANUAL_RESTORE_HINT)?;
+    let mut actions = vec![];
+    let mut mapping = engine::changes(&plan, &state.active);
+    for id in state.order.iter().rev().copied() {
+        engine::cancelled(cancel)?;
+        if !state.active.contains(&id) {
+            continue;
+        }
+        let row = &plan.rows[id];
+        progress(format!("核對復原順序 · {}", row.path));
+        let source = engine::mapped(&row.path, &mapping);
+        mapping.remove(&native::key(Path::new(&row.path)));
+        let target = engine::mapped(&row.path, &mapping);
+        actions.push(UndoAction { id, source, target });
+    }
+    Ok(UndoPlan {
+        plan,
+        actions,
+        state,
+    })
 }
 
 pub fn prepare_undo(
@@ -306,68 +466,100 @@ pub fn prepare_undo(
     cancel: &AtomicBool,
     progress: &dyn Fn(String),
 ) -> Result<(Plan, Vec<UndoAction>)> {
-    let plan = journal.load()?;
-    let (mut active, order, _) = recover_state(&plan, journal)?;
-    engine::verify(&plan, &active, cancel, progress)?;
-    let mut actions = vec![];
-    for id in order.into_iter().rev() {
-        if !active.contains(&id) {
-            continue;
-        }
-        let source = engine::mapped(&plan.rows[id].path, &engine::changes(&plan, &active));
-        active.remove(&id);
-        let target = engine::mapped(&plan.rows[id].path, &engine::changes(&plan, &active));
-        actions.push(UndoAction { id, source, target });
-    }
-    Ok((plan, actions))
+    let prepared = prepare_undo_state(journal, cancel, progress)?;
+    Ok((prepared.plan, prepared.actions))
 }
 
 pub fn undo(journal: &Journal, cancel: &AtomicBool, progress: &dyn Fn(String)) -> Result<usize> {
     let _lock = native::OperationLock::acquire()?;
-    let (plan, actions) = prepare_undo(journal, cancel, progress)?;
-    let (mut active, _, pending) = recover_state(&plan, journal)?;
+    let UndoPlan {
+        plan,
+        actions,
+        state,
+    } = prepare_undo_state(journal, cancel, progress)?;
+    let RecoveredState {
+        mut active,
+        pending,
+        mut identities,
+        ..
+    } = state;
     if let Some(id) = pending {
-        journal.append(
-            "intent_reconciled",
-            json!({"id":id,"active":active.contains(&id)}),
-        )?;
+        let mut detail = json!({"id":id,"active":active.contains(&id)});
+        if let Some(identity) = identities.get(&id) {
+            detail["identity"] = json!(identity);
+        }
+        journal.append("intent_reconciled", detail)?;
     }
     journal.append("undo_start", json!({}))?;
-    let directories = engine::directory_index(&plan);
+    let mut directories = engine::directory_index_with(&plan, &identities);
+    let mut mapping = engine::changes(&plan, &active);
+    let total = actions.len();
     let mut count = 0;
-    let result = (|| -> Result<()> {
+    let restored = (|| -> Result<()> {
         for action in actions {
             engine::cancelled(cancel)?;
             progress(format!("復原中 · {}", action.source.display()));
+            let row = &plan.rows[action.id];
+            let expected = identities
+                .get(&action.id)
+                .cloned()
+                .unwrap_or_else(|| row.identity.clone());
+            // Confirm the item before recording the intent, so a source that
+            // changed since the preview never leaves an unfinished undo entry.
+            let info = native::metadata(&action.source)?;
+            if info.link || info.identity != expected {
+                bail!("復原來源已變動或被替換，停止：{}", action.source.display());
+            }
             journal.append("undo_intent", json!({"id":action.id}))?;
             engine::move_row(
                 &plan,
-                &plan.rows[action.id],
+                row,
+                &expected,
                 &action.source,
                 &action.target,
-                &engine::changes(&plan, &active),
+                &mapping,
                 &directories,
             )?;
+            let identity = native::metadata(&action.target)?.identity;
             active.remove(&action.id);
+            mapping.remove(&native::key(Path::new(&row.path)));
+            if row.kind == Kind::Dir {
+                directories.insert(native::key(Path::new(&row.path)), identity.clone());
+            }
+            identities.insert(action.id, identity.clone());
             count += 1;
-            journal.append("undo_done", json!({"id":action.id}))?;
+            journal.append("undo_done", json!({"id":action.id,"identity":identity}))?;
         }
-        engine::verify(&plan, &active, &AtomicBool::new(false), progress)?;
         Ok(())
     })();
-    match result {
-        Ok(()) => {
-            journal.append("undo_end", json!({"status":"complete","count":count}))?;
-            Ok(count)
-        }
-        Err(error) => {
-            let _ = journal.append(
-                "undo_end",
-                json!({"status":"stopped","count":count,"reason":format!("{error:#}")}),
-            );
-            bail!("復原已停止；完成 {count} 個。保留此紀錄，可核對後繼續復原。\n{error:#}");
-        }
+    if let Err(error) = restored {
+        let _ = journal.append(
+            "undo_end",
+            json!({"status":"stopped","count":count,"reason":format!("{error:#}")}),
+        );
+        bail!(
+            "復原已停止；完成 {count} 個，共 {total} 個。保留此紀錄，可核對後繼續復原。\n{error:#}"
+        );
     }
+    if let Err(error) = engine::verify_with(
+        &plan,
+        &active,
+        &identities,
+        &AtomicBool::new(false),
+        progress,
+    ) {
+        let _ = journal.append(
+            "undo_end",
+            json!({"status":"completed_unverified","count":count,"reason":format!("{error:#}")}),
+        );
+        bail!(
+            "復原已全部完成（{count} 個），但完成後核對發現範圍有其他變動；紀錄已保留。\n{error:#}"
+        );
+    }
+    journal
+        .append("undo_end", json!({"status":"complete","count":count}))
+        .with_context(|| format!("復原已全部完成（{count} 個），但結束紀錄寫入失敗"))?;
+    Ok(count)
 }
 
 fn legacy_plan(value: Value) -> Result<Plan> {
