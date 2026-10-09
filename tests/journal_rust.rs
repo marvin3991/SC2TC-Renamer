@@ -813,15 +813,16 @@ fn undo_uses_identity_recorded_after_rename() {
     assert_eq!(snapshot(&root), before);
 }
 
-// Identity overlay: an interrupted rename whose file ID changed is matched by
-// kind and content when the original name is empty.
+// The kind-and-content fallback is reserved for volumes that renumber items
+// on rename (covered on real FAT32／exFAT by tests/fat_rust.rs). On NTFS a
+// renumbered item after an interrupted rename is an unknown object and stops
+// recovery without writing any event.
 #[test]
-fn renumbered_item_after_interrupted_rename_is_reconciled() {
+fn renumbered_item_on_a_stable_volume_is_not_reconciled_after_rename() {
     let _lock = exclusive();
     let base = fixture();
     let root = base.join("files");
     let path = file(&root, "报告.txt");
-    let before = snapshot(&root);
     let scanned = plan(&root);
     let id = row(&scanned, "报告.txt").id;
     let plan = with_identity(scanned, id, &renumbered(&identity(&path)));
@@ -831,18 +832,20 @@ fn renumbered_item_after_interrupted_rename_is_reconciled() {
     let source = PathBuf::from(&plan.rows[id].path);
     let target = source.with_file_name(&plan.rows[id].new);
     native::rename_no_replace(&source, &target, &identity(&source)).unwrap();
-    let state = journal::recover_state(&plan, &journal).unwrap();
-    assert_eq!(state.pending, Some(id));
-    assert!(state.active.contains(&id));
-    assert_eq!(state.identities.get(&id), Some(&identity(&target)));
-    assert_eq!(undo(&journal).unwrap(), 1);
-    assert_eq!(snapshot(&root), before);
+    let after_rename = snapshot(&root);
+    let error = message(journal::recover_state(&plan, &journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert!(error.contains("存在但身分不符"), "{error}");
+    let error = message(undo(&journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    assert_eq!(snapshot(&root), after_rename);
+    assert!(!names(&journal).iter().any(|e| e == "intent_reconciled"));
 }
 
-// Identity overlay: an interrupted undo whose file ID changed is matched by
-// kind and content when the new name is empty.
+// Same gate for an interrupted undo on NTFS: the item carrying another file
+// ID at the original name is not claimed.
 #[test]
-fn renumbered_item_after_interrupted_undo_is_reconciled() {
+fn renumbered_item_on_a_stable_volume_is_not_reconciled_after_undo() {
     let _lock = exclusive();
     let base = fixture();
     let root = base.join("files");
@@ -863,12 +866,12 @@ fn renumbered_item_after_interrupted_undo_is_reconciled() {
     ] {
         journal.append(event, detail).unwrap();
     }
-    let state = journal::recover_state(&plan, &journal).unwrap();
-    assert_eq!(state.pending, Some(id));
-    assert!(!state.active.contains(&id));
-    assert_eq!(state.identities.get(&id), Some(&identity(&path)));
-    assert_eq!(undo(&journal).unwrap(), 0);
+    let error = message(journal::recover_state(&plan, &journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
+    let error = message(undo(&journal).unwrap_err());
+    assert!(error.contains("無法唯一核對"), "{error}");
     assert_eq!(snapshot(&root), before);
+    assert!(!names(&journal).iter().any(|e| e == "intent_reconciled"));
 }
 
 // The kind-and-content fallback never accepts a junction for a folder.

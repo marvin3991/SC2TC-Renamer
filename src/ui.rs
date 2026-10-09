@@ -440,7 +440,10 @@ impl App {
         }
         if self.busy() || self.confirm || self.message.is_some() || self.dictionary_dialog {
             self.status = ADD_REFUSED.to_owned();
-            self.notice = Some(ADD_REFUSED.to_owned());
+            // While the window waits for a safe stop, keep that notice visible.
+            if !(self.busy() && self.cancel.load(Ordering::Relaxed)) {
+                self.notice = Some(ADD_REFUSED.to_owned());
+            }
             return false;
         }
         self.spawn(ctx, Job::Add, move |cancel, progress| {
@@ -660,8 +663,7 @@ impl App {
             }
             Err(error) => {
                 self.status = error.lines().next().unwrap_or("已停止").to_owned();
-                // The switch may already have taken effect when only the final
-                // log entry failed; show the store's actual state.
+                // Show the store's actual state after a failed switch.
                 if matches!(job, Some(Job::ActivateDictionary | Job::ResetDictionary))
                     && let Ok((version, _)) = Store::standard().and_then(|s| s.current())
                 {

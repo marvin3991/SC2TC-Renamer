@@ -79,7 +79,7 @@ Get-Content -LiteralPath (Join-Path $taskFixture 'verification.json') -Encoding 
 | 參數 | 用途 | 網路 |
 |------|------|------|
 | `--self-test <尚不存在的資料夾>` | 在該資料夾建立合成檔案，以兩種模式實際改名並復原，結果寫入 `verification.json`；使用資料夾內的隔離字典儲存與內附轉換表 | 不需要 |
-| `--ui-self-check <尚不存在的資料夾>` | 以合成預覽開啟視窗，切換到最小尺寸後檢查底部按鈕可見與實際尺寸，並記錄中文字型是否載入，結果寫入 `ui-verification.json`；手動診斷用，CI 未執行 | 不需要 |
+| `--ui-self-check <尚不存在的資料夾>` | 以合成預覽開啟視窗，切換到最小尺寸後檢查底部按鈕可見與實際尺寸，並記錄中文字型是否載入，結果寫入 `ui-verification.json`；與 `--self-test` 一樣使用資料夾內的隔離字典儲存；手動診斷用，CI 未執行 | 不需要 |
 | `--self-test-update <尚不存在的資料夾>` | 從 crates.io 下載並驗證 zhconv 正式版，在資料夾內的隔離儲存套用後再回復內附表，結果寫入 `update-verification.json` | 需要 |
 | `--check-dictionary-update <JSON 路徑>` | 查詢 crates.io 上 zhconv 的最新正式版資訊並寫入該 JSON | 需要 |
 

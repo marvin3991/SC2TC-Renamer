@@ -323,10 +323,10 @@ fn describe(probe: &Probe) -> &'static str {
 }
 
 /// Decides whether an interrupted operation moved the item, using the
-/// recorded identity first and, on volumes that renumber items when they are
-/// renamed, the unchanged kind, size and modification time. The fallback
-/// applies to whichever name the interrupted rename or undo moved the item to,
-/// and only while the other name is empty.
+/// recorded identity first and, only on volumes that renumber items when they
+/// are renamed (FAT family), the unchanged kind, size and modification time.
+/// The fallback applies to whichever name the interrupted rename or undo
+/// moved the item to, and only while the other name is empty.
 fn reconcile(
     row: &Row,
     expected: &Identity,
@@ -335,8 +335,14 @@ fn reconcile(
 ) -> Result<(bool, Option<Identity>)> {
     let before = probe(original, expected)?;
     let after = probe(changed, expected)?;
+    let renumbers = original
+        .parent()
+        .map(native::volume_renumbers_on_rename)
+        .transpose()?
+        .unwrap_or(false);
     let renumbered = |info: &native::Metadata| {
-        !info.link
+        renumbers
+            && !info.link
             && info.directory == (row.kind == Kind::Dir)
             && info.identity.volume == expected.volume
             && info.identity.size == expected.size
@@ -535,9 +541,15 @@ pub fn undo(journal: &Journal, cancel: &AtomicBool, progress: &dyn Fn(String)) -
             // Confirm the item before recording the intent, so a source that
             // changed since the preview never leaves an unfinished undo entry.
             let changed = || format!("復原來源已變動或被替換，停止：{}", action.source.display());
-            match probe(&action.source, &expected).with_context(changed)? {
+            let source = probe(&action.source, &expected)
+                .with_context(|| format!("無法核對復原來源：{}", action.source.display()))?;
+            let restored = || {
+                probe(&action.target, &expected)
+                    .with_context(|| format!("無法核對原名稱：{}", action.target.display()))
+            };
+            match source {
                 Probe::Matches => {}
-                Probe::Missing if matches!(probe(&action.target, &expected)?, Probe::Matches) => {
+                Probe::Missing if matches!(restored()?, Probe::Matches) => {
                     // Another program moved the item back after the preview.
                     // Record what the file system shows so the next undo
                     // continues from the actual state.

@@ -20,6 +20,9 @@ const ERROR_SAMPLE_LIMIT: usize = 3;
 /// text is part of the name and is converted with it.
 const MAX_EXTENSION_CHARS: usize = 10;
 pub const ISSUE_CODE_CASE_COLLISION: &str = "case-collision";
+/// Protection reason recorded for links; v1.0.0 wrote it for every reparse
+/// point, including cloud placeholders that are ordinary items now.
+const LINK_REASON: &str = "連結／接合點：不進入、不改名";
 const EXCLUDED_NAMES: &[&str] = &[
     ".git",
     ".venv",
@@ -225,7 +228,7 @@ fn protection(
     legacy: bool,
 ) -> String {
     if info.link {
-        "連結／接合點：不進入、不改名".to_owned()
+        LINK_REASON.to_owned()
     } else if info.attributes & native::HIDDEN_SYSTEM != 0 {
         "隱藏或系統項目：保留".to_owned()
     } else if exclusions.matches(path, info) {
@@ -462,6 +465,11 @@ pub fn make_plan_with_mode(
             blocked_parents.insert(native::key(p));
         }
     }
+    let collision_parents: BTreeSet<String> = issues
+        .iter()
+        .filter(|i| i.code == ISSUE_CODE_CASE_COLLISION)
+        .map(|i| native::key(Path::new(&i.path)))
+        .collect();
     let mut rows = vec![];
     for record in &records {
         cancelled(cancel)?;
@@ -500,9 +508,19 @@ pub fn make_plan_with_mode(
             status: Status::Unchanged,
             reason: "名稱不變".to_owned(),
         };
+        let under_collision = path
+            .ancestors()
+            .skip(1)
+            .any(|p| collision_parents.contains(&native::key(p)));
         if !record.protected.is_empty() {
             row.status = Status::Excluded;
             row.reason = record.protected.clone();
+            row.new = old;
+        } else if under_collision {
+            // The parent folder shares its key with another folder; its
+            // children were listed before the collision was detected.
+            row.status = Status::Excluded;
+            row.reason = "上層資料夾名稱僅大小寫不同的項目並存：保留".to_owned();
             row.new = old;
         } else if row.new != row.old {
             row.status = Status::Ready;
@@ -715,7 +733,7 @@ pub fn verify_with(
                 .map(|row| (native::key(Path::new(&row.path)), identity))
         })
         .collect();
-    let expected: BTreeMap<_, _> = plan
+    let mut expected: BTreeMap<_, _> = plan
         .records
         .iter()
         .map(|r| {
@@ -729,7 +747,7 @@ pub fn verify_with(
             )
         })
         .collect();
-    let actual: BTreeMap<_, _> = records
+    let mut actual: BTreeMap<_, _> = records
         .iter()
         .map(|r| {
             (
@@ -738,6 +756,25 @@ pub fn verify_with(
             )
         })
         .collect();
+    // Records written by v1.0.0 treated every reparse point as a link and never
+    // listed its children. An item that is a non-surrogate reparse point today
+    // (cloud placeholder) is the same item, so it and anything found below it
+    // are left out of the comparison instead of failing the whole recovery.
+    for record in &plan.records {
+        if record.kind != Kind::Link || record.protected != LINK_REASON {
+            continue;
+        }
+        let current = mapped(&record.path, &mapping);
+        let Ok(info) = native::metadata(&current) else {
+            continue;
+        };
+        if info.link || info.attributes & native::REPARSE_POINT == 0 {
+            continue;
+        }
+        let key = native::key(&current);
+        expected.remove(&key);
+        actual.retain(|k, _| k != &key && !native::contains(Path::new(&key), Path::new(k)));
+    }
     let issue_set = |items: &[Issue]| {
         items
             .iter()

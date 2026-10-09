@@ -190,6 +190,8 @@ fn run(args: &[OsString]) -> Result<()> {
     };
     let history = engine::history_root()?;
     let fixture = if let Some(path) = &out {
+        // Like --self-test: never read the user's applied dictionary state.
+        sc2tc_renamer::updater::Store::override_standard_root(path.join("dictionary-store"))?;
         Some(diagnostics::ui_fixture(path)?)
     } else {
         None

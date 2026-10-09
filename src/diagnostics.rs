@@ -39,8 +39,11 @@ pub fn failure_report_path(args: &[OsString]) -> Option<PathBuf> {
         return None;
     }
     let output = PathBuf::from(args.get(1)?);
-    output.file_name()?;
-    Some(output.with_extension("failure.json"))
+    // Append rather than replace an extension: `work\update.json` reports to
+    // `work\update.json.failure.json`, as docs/BUILD.md states.
+    let mut name = output.file_name()?.to_os_string();
+    name.push(".failure.json");
+    Some(output.with_file_name(name))
 }
 /// Whether a measured `[width, height]` matches the expected one within `tolerance`.
 pub fn size_matches(actual: [f32; 2], expected: [f32; 2], tolerance: f32) -> bool {

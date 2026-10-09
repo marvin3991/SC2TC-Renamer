@@ -16,6 +16,10 @@ pub const HIDDEN_SYSTEM: u32 = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
 /// placeholders (OneDrive), WOF and deduplicated files carry
 /// FILE_ATTRIBUTE_REPARSE_POINT without it and are ordinary files or folders.
 pub const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+/// winnt.h `FILE_SUPPORTS_OPEN_BY_FILE_ID` (windows-sys keeps it behind the
+/// `Win32_System_SystemServices` feature): set by NTFS and ReFS, whose file IDs
+/// survive a rename; absent on FAT, FAT32 and exFAT.
+const FILE_SUPPORTS_OPEN_BY_FILE_ID: u32 = 0x0100_0000;
 /// FAT, FAT32 and exFAT report file ID 0 for the volume root (fastfat
 /// `FatGenerateFileIdFromDirentOffset`, verified on both file systems). The
 /// root can never be renamed or replaced, so a fixed sentinel is a stable
@@ -83,6 +87,8 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
             | Prefix::VerbatimDisk(_)
             | Prefix::UNC(..)
             | Prefix::VerbatimUNC(..) => {}
+            // A volume without a drive letter is addressed as `\\?\Volume{GUID}\`.
+            Prefix::Verbatim(name) if is_volume_guid(name) => {}
             Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
                 bail!("{DEVICE_PATH_UNSUPPORTED}{}", path.display());
             }
@@ -256,6 +262,46 @@ fn from_handle(handle: &Handle, volume_root: bool) -> Result<Metadata> {
 
 pub fn metadata(path: &Path) -> Result<Metadata> {
     from_handle(&open(path, FILE_READ_ATTRIBUTES)?, is_volume_root(path))
+}
+
+/// `Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`: the verbatim prefix of a
+/// volume mounted without a drive letter.
+pub fn is_volume_guid(name: &OsStr) -> bool {
+    const GUID_LEN: usize = 36;
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix("Volume{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|guid| {
+            guid.len() == GUID_LEN && guid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        })
+}
+
+/// True when the volume holding `path` assigns a new file ID on rename.
+/// NTFS and ReFS report FILE_SUPPORTS_OPEN_BY_FILE_ID and keep IDs stable;
+/// FAT, FAT32 and exFAT do not (measured on both), so recovery may fall back
+/// to size and timestamp comparison only there.
+pub fn volume_renumbers_on_rename(path: &Path) -> Result<bool> {
+    let handle = open(path, FILE_READ_ATTRIBUTES)?;
+    let mut flags: u32 = 0;
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            handle.0,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut flags,
+            ptr::null_mut(),
+            0,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("無法讀取磁碟區資訊：{}", path.display()));
+    }
+    Ok(flags & FILE_SUPPORTS_OPEN_BY_FILE_ID == 0)
 }
 
 pub fn valid_name(name: &str) -> bool {
