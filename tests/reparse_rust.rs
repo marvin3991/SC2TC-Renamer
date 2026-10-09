@@ -477,10 +477,10 @@ fn v1_0_0_link_record_does_not_accept_a_junction_in_its_place() {
     fs::create_dir(&elsewhere).unwrap();
     junction(&legacy.placeholder, &elsewhere);
     assert!(native::metadata(&legacy.placeholder).unwrap().link);
-    let error = journal::prepare_undo(&legacy.journal, &AtomicBool::new(false), &|_| {})
-        .err()
-        .expect("接合點取代紀錄中的項目時不得放行復原");
-    let message = format!("{error:#}");
+    let message = match journal::prepare_undo(&legacy.journal, &AtomicBool::new(false), &|_| {}) {
+        Ok(_) => panic!("接合點取代紀錄中的項目時不得放行復原"),
+        Err(error) => format!("{error:#}"),
+    };
     assert!(
         message.contains("範圍已有新增、移除、修改或替換的項目"),
         "{message}"
