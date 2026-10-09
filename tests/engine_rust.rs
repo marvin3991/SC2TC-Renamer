@@ -150,10 +150,16 @@ impl Subst {
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .is_ok_and(|o| o.status.success());
-            let mapped = Self { drive };
             // Another process may take the same letter between the check and
-            // SUBST; only accept the letter when it resolves to the target.
-            if created && fs::canonicalize(mapped.root()).ok() == fs::canonicalize(target).ok() {
+            // SUBST. When SUBST fails the letter belongs to someone else, so
+            // no guard is built: its Drop would remove their mapping.
+            if !created {
+                continue;
+            }
+            let mapped = Self { drive };
+            // Only accept the letter when it resolves to the target; otherwise
+            // dropping the guard removes the mapping this call created.
+            if fs::canonicalize(mapped.root()).ok() == fs::canonicalize(target).ok() {
                 return mapped;
             }
         }
