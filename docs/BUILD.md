@@ -6,7 +6,7 @@
 - 本專案驗證工具鏈固定為 Rust `1.98.0`、target `x86_64-pc-windows-msvc`。
 - 打包與發布工具使用 Python `3.11` 以上，僅依賴標準函式庫。執行產品不需要 Python。
 - GitHub CLI 範例使用已登入的 `gh`；亦可從 Release 頁面直接下載公開附件。
-- FAT32／exFAT 手動檢查需要系統管理員權限（以 `diskpart` 建立暫時 VHDX）；其他測試不需要。
+- `tests/fat_rust.rs` 以 `diskpart` 建立暫時 VHDX 驗證 FAT32 與 exFAT，需要系統管理員權限，約需 2 分鐘；沒有權限或環境不支援 VHDX 時會印出原因並略過（不算失敗）。`tests/reparse_rust.rs` 會在 `work/` 下設定自訂 tag 的 reparse point，設定失敗時同樣略過該段。其他測試不需要特殊權限。
 
 ## 下載附件與存放位置
 
@@ -87,7 +87,7 @@ Get-Content -LiteralPath (Join-Path $taskFixture 'verification.json') -Encoding 
 
 ## FAT32／exFAT 手動檢查
 
-CI 與一般測試只使用 NTFS。FAT 類檔案系統的根目錄身分與改名後身分變化，請以系統管理員 PowerShell 在暫時 VHDX 上檢查；不要用實際的隨身碟或資料磁碟。下例使用代號 `T:`，請先確認未被占用；VHDX 路徑只用 ASCII 字元。
+`tests/fat_rust.rs` 已在系統管理員權限下自動驗證根目錄身分、改名後身分變化與中斷核對。要用 GUI 實際操作檢查時，請以系統管理員 PowerShell 在暫時 VHDX 上進行；不要用實際的隨身碟或資料磁碟。下例使用代號 `T:`，請先確認未被占用；VHDX 路徑只用 ASCII 字元。
 
 ```powershell
 chcp 65001 > $null

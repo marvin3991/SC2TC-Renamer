@@ -54,23 +54,10 @@ fn checked(result: Result<()>, cancel: &AtomicBool, hint: &'static str) -> Resul
     }
 }
 
-/// Explains a failed scope check before undo. `engine::verify` states its
-/// rescan advice on the first line and lists the differing paths after it;
-/// rescanning cannot help a recovery, so only the paths are kept.
+/// Explains a failed scope check before undo; rescanning cannot help a
+/// recovery, so the hint points to manual restoration instead.
 fn undo_checked(result: Result<()>, cancel: &AtomicBool) -> Result<()> {
-    let Err(error) = result else {
-        return Ok(());
-    };
-    if cancel.load(Ordering::Relaxed) {
-        return Err(error);
-    }
-    let message = error.to_string();
-    match message.split_once('\n') {
-        Some((_, sample)) if error.chain().count() == 1 => {
-            bail!("{MANUAL_RESTORE_HINT}。\n{sample}")
-        }
-        _ => Err(error.context(MANUAL_RESTORE_HINT)),
-    }
+    checked(result, cancel, MANUAL_RESTORE_HINT)
 }
 
 impl Journal {
@@ -639,7 +626,8 @@ fn legacy_plan(value: Value) -> Result<Plan> {
             .get(1)
             .context("舊版項目缺少身分")?
             .to_string()
-            .parse::<u128>()?;
+            .parse::<u128>()
+            .context("舊版項目身分格式不合法")?;
         let (size, modified_ticks) = if kind == Kind::File {
             let size = parts
                 .get(2)
@@ -649,7 +637,8 @@ fn legacy_plan(value: Value) -> Result<Plan> {
                 .get(3)
                 .context("舊版項目缺少時間")?
                 .to_string()
-                .parse::<i128>()?;
+                .parse::<i128>()
+                .context("舊版項目時間格式不合法")?;
             let ticks = nanos / native::NANOS_PER_FILETIME_TICK
                 + i128::from(native::WINDOWS_UNIX_EPOCH_TICKS);
             (Some(size), Some(u64::try_from(ticks)?))

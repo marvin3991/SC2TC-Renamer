@@ -80,11 +80,11 @@ Get-FileHash -LiteralPath 'C:\Downloads\SC2TC-Renamer-v1.1.0-portable.zip' -Algo
 | 隱藏／系統屬性項目 | 排除，不掃描其子項目。直接選為範圍的資料夾本身不受此限 |
 | 系統或程式資料夾名稱：`.git`、`.venv`、`node_modules`、`$RECYCLE.BIN`、`System Volume Information`、`target` | 不分大小寫，檔案與資料夾都算；排除且不掃描其子項目。直接選為範圍的資料夾本身不受此限 |
 | 符號連結、接合點等名稱代理類 reparse point | 排除，不進入、不改名 |
-| OneDrive 檔案隨選等雲端佔位項目、WOF 壓縮檔 | 視為一般檔案；改名後由 OneDrive 自行同步 |
+| OneDrive 檔案隨選等雲端佔位項目 | 視為一般檔案；改名後由 OneDrive 自行同步 |
 | 工具紀錄目錄（`%LOCALAPPDATA%\SC2TC-Renamer\history\` 與舊版 `OpenCCRenamer\history\`） | 以路徑與項目身分排除，經 SUBST、接合點或短檔名等別名選到也能辨識；範圍落在紀錄目錄內時，掃描直接拒絕 |
 | 名稱以句點結尾的資料夾（WSL、macOS 等建立） | 依原名稱列舉子項目，不會讀到去掉句點的另一個資料夾；本身不符合 Windows 名稱規則，保留原名 |
 | 轉換後完整路徑（含 `\\?\` 前綴）達到 Windows 上限 32,767 個 UTF-16 字元 | 造成變長的上層資料夾與該項目保留原名，理由為「轉換後路徑超出 Windows 上限」 |
-| FAT、FAT32、exFAT 磁碟 | 根目錄可加入；這類檔案系統改名後項目身分（file ID）可能改變，改名與復原後會重新讀取身分並記入 `events.jsonl`，供完成後核對與復原 |
+| FAT、FAT32、exFAT 磁碟 | 根目錄可加入；這類檔案系統改名後項目身分（file ID）會改變（FAT32 與 exFAT 實測皆如此），改名與復原後會重新讀取身分並記入 `events.jsonl`，供完成後核對與復原 |
 | 預覽後內容或範圍改變 | 核對項目身分、大小及修改時間；不符即停止 |
 | 從改名到復原之間，範圍內有任何新增、移除或修改（包括與本次改名無關的項目） | 自動復原停止並說明原因；移除新增的項目或還原變動後重試，或依 `preview.csv` 手動復原 |
 | 改名全部完成，但完成後核對發現其他變動或結束紀錄寫入失敗 | 訊息說明改名已全部完成（N 個）；紀錄保留，可用於復原 |

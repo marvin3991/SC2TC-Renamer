@@ -753,9 +753,7 @@ pub fn verify_with(
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        bail!(
-            "範圍已有新增、移除、修改或替換的項目，停止。請重新掃描；復原時請保留紀錄查核。\n{sample}"
-        );
+        bail!("範圍已有新增、移除、修改或替換的項目，停止。\n{sample}");
     }
     let expected_issues = issue_set(&plan.issues);
     let current_issues = issue_set(&issues);
@@ -773,7 +771,7 @@ pub fn verify_with(
             .map(|issue| format!("{} · {} · {}", issue.path, issue.code, issue.reason))
             .collect::<Vec<_>>()
             .join("\n");
-        bail!("掃描問題已變更，停止；請核對路徑與錯誤後重新掃描，復原時保留紀錄。\n{sample}");
+        bail!("掃描問題已變更，停止。\n{sample}");
     }
     Ok(())
 }

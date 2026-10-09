@@ -246,6 +246,12 @@ fn button(text: &str) -> egui::Button<'_> {
 impl App {
     pub fn new(ctx: &Context, history: PathBuf) -> Self {
         let fonts_loaded = configure(ctx);
+        let dictionary = Store::standard().and_then(|s| s.current());
+        let status = match &dictionary {
+            _ if !fonts_loaded => FONT_MISSING.to_owned(),
+            Err(error) => format!("轉換表狀態無法讀取：{error:#}"),
+            Ok(_) => "加入檔案或資料夾，先預覽，再確認改名。".to_owned(),
+        };
         let image = image::load_from_memory(include_bytes!("../assets/logo-v2.png"))
             .expect("embedded logo")
             .into_rgba8();
@@ -278,12 +284,7 @@ impl App {
             receiver: None,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(String::new())),
-            status: if fonts_loaded {
-                "加入檔案或資料夾，先預覽，再確認改名。"
-            } else {
-                FONT_MISSING
-            }
-            .to_owned(),
+            status,
             notice: None,
             message: None,
             confirm: false,
@@ -293,8 +294,7 @@ impl App {
             dictionary_dialog: false,
             dictionary_release: None,
             dictionary_candidate: None,
-            dictionary_version: Store::standard()
-                .and_then(|s| s.current())
+            dictionary_version: dictionary
                 .map(|x| x.0)
                 .unwrap_or_else(|_| "狀態待查核".to_owned()),
             fonts_loaded,
@@ -660,6 +660,13 @@ impl App {
             }
             Err(error) => {
                 self.status = error.lines().next().unwrap_or("已停止").to_owned();
+                // The switch may already have taken effect when only the final
+                // log entry failed; show the store's actual state.
+                if matches!(job, Some(Job::ActivateDictionary | Job::ResetDictionary))
+                    && let Ok((version, _)) = Store::standard().and_then(|s| s.current())
+                {
+                    self.dictionary_version = version;
+                }
                 if matches!(job, Some(Job::Apply | Job::Undo)) {
                     self.applied = true;
                     let missing = self.remap_scopes();
