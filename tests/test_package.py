@@ -79,6 +79,12 @@ class PackageTests(unittest.TestCase):
     def test_repository_snapshot_includes_icon_generator(self):
         self.assertIn(ROOT / "examples" / "prepare_icon.rs", PACKAGE.source_files())
 
+    def test_portable_documents_include_changelog_from_snapshot(self):
+        self.assertIn("CHANGELOG.md", PACKAGE.PORTABLE_FILES)
+        for name in PACKAGE.PORTABLE_FILES:
+            with self.subTest(name=name):
+                self.assertIn(name, PACKAGE.SOURCE_FILES)
+
 
 if __name__ == "__main__":
     unittest.main()

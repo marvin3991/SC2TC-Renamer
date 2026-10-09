@@ -23,7 +23,7 @@ SC2TC-Renamer 以 Rust 開發，使用 MediaWiki 中文轉換表，提供一般�
 
 | 附件 | 說明 |
 |------|------|
-| `SC2TC-Renamer-v<版本>-portable.zip` | Windows x64 執行檔、使用說明與授權文件 |
+| `SC2TC-Renamer-v<版本>-portable.zip` | Windows x64 執行檔、使用說明、版本變更紀錄與授權文件 |
 | `SC2TC-Renamer-v<版本>-source.zip` | 同版本完整對應原始碼，包含鎖定的第三方相依套件 |
 | `SHA256SUMS.txt` | 本表其他附件的 SHA-256，可在下載資料夾直接核對；不含 ZIP 內的執行檔 |
 | `release-manifest.json` | 來源提交、版本、檔案大小、授權資訊，以及 portable ZIP 內執行檔的 SHA-256 |
