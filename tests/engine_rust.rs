@@ -29,6 +29,29 @@ use uuid::Uuid;
 use windows_sys::Win32::{Storage::FileSystem::*, System::Threading::CREATE_NO_WINDOW};
 
 const TEST_NAME: &str = "engine_rust";
+/// Other tests in this binary and other test processes on this machine share
+/// the cross-process operation lock, which `apply` and `undo` take without
+/// waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+
+/// Holds the operation lock for a whole test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `apply` and `undo` in the test still acquire it, while other threads and
+/// processes wait instead of failing with the busy message.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
 
 fn work() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("work")
@@ -202,6 +225,7 @@ fn dotted_chinese_names_convert_whole_and_folders_match_files() {
 
 #[test]
 fn kelvin_sign_case_collision_is_reported_and_blocks_parent() {
+    let _lock = exclusive();
     let base = fixture();
     // U+212A KELVIN SIGN lower-cases to "k" but NTFS upper-cases it to itself,
     // so both names coexist on an ordinary case-insensitive folder.
@@ -242,6 +266,7 @@ fn kelvin_sign_case_collision_is_reported_and_blocks_parent() {
 
 #[test]
 fn case_sensitive_folder_collision_is_reported() {
+    let _lock = exclusive();
     let base = fixture();
     let folder = base.join("简体目录");
     fs::create_dir(&folder).unwrap();
@@ -372,6 +397,7 @@ fn scope_inside_history_root_is_refused_even_through_alias() {
 
 #[test]
 fn unpaired_surrogate_name_is_an_issue_not_a_scan_failure() {
+    let _lock = exclusive();
     const UNPAIRED_HIGH_SURROGATE: u16 = 0xD800;
     let base = fixture();
     let sibling = write(&base, "简体目录/报告.txt");
@@ -526,6 +552,7 @@ fn subst_root_protects_recycle_bin_and_program_folders() {
 
 #[test]
 fn trailing_dot_folder_is_scanned_verbatim() {
+    let _lock = exclusive();
     let base = fixture();
     // Alone: the folder named "资料." is listed as itself, not as "资料".
     let alone = base.join("alone");
