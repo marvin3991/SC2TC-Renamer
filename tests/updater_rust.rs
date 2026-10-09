@@ -2,6 +2,7 @@ use anyhow::Result;
 use flate2::{Compression, write::GzEncoder};
 use sc2tc_renamer::{
     converter::{self, Converter, ENGINE_VERSION, Mode},
+    native,
     updater::{self, Release, Store},
 };
 use serde_json::json;
@@ -11,6 +12,7 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     sync::{Once, atomic::AtomicBool},
+    time::Duration,
 };
 use tar::{Builder, EntryType, Header};
 
@@ -20,6 +22,29 @@ const BUSY_PREFIX: &str = "另一個視窗正在";
 /// `std::io::ErrorKind::UnexpectedEof` text that flate2 1.1.10 returns for a
 /// truncated or non-gzip stream (observed with the pinned versions in Cargo.lock).
 const BAD_GZIP: &str = "unexpected end of file";
+/// Other tests in this binary and other test processes on this machine share
+/// the cross-process operation lock, which `activate` and `reset_embedded`
+/// take without waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+
+/// Holds the operation lock for a whole test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `activate` and `reset_embedded` in the test still acquire it, while other
+/// threads and processes wait instead of failing with the busy message.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
 
 /// Points `Store::standard()` at an isolated, empty store for this test binary,
 /// so nothing here reads or writes the real %LOCALAPPDATA% dictionary state.
@@ -166,6 +191,7 @@ fn release(bytes: &[u8]) -> Release {
 }
 #[test]
 fn official_table_shape_stages_activates_reuses_and_rolls_back_in_fixture() {
+    let _lock = exclusive();
     let bytes = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -207,6 +233,7 @@ fn official_table_shape_stages_activates_reuses_and_rolls_back_in_fixture() {
 }
 #[test]
 fn all_official_source_rules_match_bundled_engine_and_regional_overrides() {
+    let _lock = exclusive();
     assert_eq!(
         hash(converter::EMBEDDED_SOURCE),
         converter::EMBEDDED_SOURCE_SHA256
@@ -259,6 +286,7 @@ fn all_official_source_rules_match_bundled_engine_and_regional_overrides() {
 }
 #[test]
 fn bad_hash_size_unofficial_and_prerelease_sources_are_rejected() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -294,6 +322,7 @@ fn bad_hash_size_unofficial_and_prerelease_sources_are_rejected() {
 }
 #[test]
 fn unsupported_empty_malformed_duplicate_and_executable_php_are_rejected() {
+    let _lock = exclusive();
     let source = std::str::from_utf8(converter::EMBEDDED_SOURCE).unwrap();
     let examples = [
         (Vec::new(), "MediaWiki 來源為空或超出上限"),
@@ -341,6 +370,7 @@ fn php_comments_close_only_after_the_opening_marker() {
 }
 #[test]
 fn archive_traversal_links_duplicates_and_missing_table_are_rejected() {
+    let _lock = exclusive();
     let source = converter::EMBEDDED_SOURCE;
     let cases = [
         (
@@ -413,6 +443,7 @@ fn archive_traversal_links_duplicates_and_missing_table_are_rejected() {
 }
 #[test]
 fn changed_staged_files_or_recomputed_rules_cannot_be_activated() {
+    let _lock = exclusive();
     let data = bytes();
     let names = {
         let directory = fixture();
@@ -448,6 +479,7 @@ fn changed_staged_files_or_recomputed_rules_cannot_be_activated() {
 }
 #[test]
 fn activation_and_active_state_reject_paths_outside_store() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -592,6 +624,7 @@ fn redirects_stay_on_https_crates_io_and_only_success_statuses_pass() {
 }
 #[test]
 fn cancellation_stops_before_network_and_preserves_current_state() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -616,6 +649,7 @@ fn old_opencc_mode_names_are_not_accepted_as_mediawiki_modes() {
 }
 #[test]
 fn an_unfinished_stage_is_preserved_and_does_not_block_retry() {
+    let _lock = exclusive();
     let directory = fixture();
     let store = store(&directory);
     let unfinished = store.root.join("bundles/pending-interrupted-fixture");
@@ -636,6 +670,7 @@ fn an_unfinished_stage_is_preserved_and_does_not_block_retry() {
 }
 #[test]
 fn a_damaged_or_outdated_staged_copy_is_moved_aside_and_staged_again() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -695,6 +730,7 @@ fn a_damaged_or_outdated_staged_copy_is_moved_aside_and_staged_again() {
 }
 #[test]
 fn a_junction_at_the_staged_bundle_path_is_never_followed_or_moved() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -712,6 +748,7 @@ fn a_junction_at_the_staged_bundle_path_is_never_followed_or_moved() {
 }
 #[test]
 fn embedded_state_from_another_engine_version_falls_back_to_the_embedded_table() {
+    let _lock = exclusive();
     let directory = fixture();
     let store = store(&directory);
     let state = store.root.join("active.json");
@@ -737,6 +774,7 @@ fn embedded_state_from_another_engine_version_falls_back_to_the_embedded_table()
 }
 #[test]
 fn a_damaged_active_bundle_points_to_the_offline_reset() {
+    let _lock = exclusive();
     let data = bytes();
     let directory = fixture();
     let store = store(&directory);
@@ -750,6 +788,7 @@ fn a_damaged_active_bundle_points_to_the_offline_reset() {
 }
 #[test]
 fn an_unwritable_update_log_stops_activation_and_reset_before_state_changes() {
+    let _lock = exclusive();
     fn read_only(path: &Path, value: bool) {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_readonly(value);
@@ -773,6 +812,7 @@ fn an_unwritable_update_log_stops_activation_and_reset_before_state_changes() {
 }
 #[test]
 fn a_store_below_a_relocated_local_appdata_junction_is_usable() {
+    let _lock = exclusive();
     let outer = fixture();
     let target = outer.join("target-local");
     fs::create_dir(&target).unwrap();
@@ -808,6 +848,7 @@ fn a_store_below_a_relocated_local_appdata_junction_is_usable() {
 }
 #[test]
 fn junction_store_and_broken_state_links_are_rejected() {
+    let _lock = exclusive();
     let outer = fixture();
     let target = outer.join("target");
     fs::create_dir(&target).unwrap();

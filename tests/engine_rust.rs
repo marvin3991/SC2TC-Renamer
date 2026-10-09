@@ -29,6 +29,29 @@ use uuid::Uuid;
 use windows_sys::Win32::{Storage::FileSystem::*, System::Threading::CREATE_NO_WINDOW};
 
 const TEST_NAME: &str = "engine_rust";
+/// Other tests in this binary and other test processes on this machine share
+/// the cross-process operation lock, which `apply` and `undo` take without
+/// waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+
+/// Holds the operation lock for a whole test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `apply` and `undo` in the test still acquire it, while other threads and
+/// processes wait instead of failing with the busy message.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
 
 fn work() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("work")
@@ -127,10 +150,16 @@ impl Subst {
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .is_ok_and(|o| o.status.success());
-            let mapped = Self { drive };
             // Another process may take the same letter between the check and
-            // SUBST; only accept the letter when it resolves to the target.
-            if created && fs::canonicalize(mapped.root()).ok() == fs::canonicalize(target).ok() {
+            // SUBST. When SUBST fails the letter belongs to someone else, so
+            // no guard is built: its Drop would remove their mapping.
+            if !created {
+                continue;
+            }
+            let mapped = Self { drive };
+            // Only accept the letter when it resolves to the target; otherwise
+            // dropping the guard removes the mapping this call created.
+            if fs::canonicalize(mapped.root()).ok() == fs::canonicalize(target).ok() {
                 return mapped;
             }
         }
@@ -202,6 +231,7 @@ fn dotted_chinese_names_convert_whole_and_folders_match_files() {
 
 #[test]
 fn kelvin_sign_case_collision_is_reported_and_blocks_parent() {
+    let _lock = exclusive();
     let base = fixture();
     // U+212A KELVIN SIGN lower-cases to "k" but NTFS upper-cases it to itself,
     // so both names coexist on an ordinary case-insensitive folder.
@@ -242,6 +272,7 @@ fn kelvin_sign_case_collision_is_reported_and_blocks_parent() {
 
 #[test]
 fn case_sensitive_folder_collision_is_reported() {
+    let _lock = exclusive();
     let base = fixture();
     let folder = base.join("简体目录");
     fs::create_dir(&folder).unwrap();
@@ -372,6 +403,7 @@ fn scope_inside_history_root_is_refused_even_through_alias() {
 
 #[test]
 fn unpaired_surrogate_name_is_an_issue_not_a_scan_failure() {
+    let _lock = exclusive();
     const UNPAIRED_HIGH_SURROGATE: u16 = 0xD800;
     let base = fixture();
     let sibling = write(&base, "简体目录/报告.txt");
@@ -526,6 +558,7 @@ fn subst_root_protects_recycle_bin_and_program_folders() {
 
 #[test]
 fn trailing_dot_folder_is_scanned_verbatim() {
+    let _lock = exclusive();
     let base = fixture();
     // Alone: the folder named "资料." is listed as itself, not as "资料".
     let alone = base.join("alone");
@@ -690,4 +723,139 @@ fn dictionary_lock_busy_reports_dictionary_update() {
     assert!(message.contains("更新轉換表"), "{message}");
     assert_ne!(message, native::OPERATION_BUSY);
     assert!(native::OperationLock::dictionary_with_timeout(FREE_WAIT_MS).is_ok());
+}
+
+// native-engine-2: two folders whose names differ only by case. The second
+// one is protected and not expanded; the children already listed below the
+// first one must not stay Ready (their parent record was replaced).
+#[test]
+fn case_collision_between_folders_excludes_their_children() {
+    let _lock = exclusive();
+    let base = fixture();
+    // U+212A KELVIN SIGN: both folder names share one key, yet NTFS keeps
+    // them apart in an ordinary case-insensitive folder.
+    let kelvin = base.join("简\u{212A}");
+    let ascii = base.join("简k");
+    write(&kelvin, "报告.txt");
+    write(&ascii, "软件.txt");
+    let sibling = write(&base, "说明.txt");
+    assert_eq!(native::key(&kelvin), native::key(&ascii));
+    assert_ne!(
+        native::metadata(&kelvin).unwrap().identity,
+        native::metadata(&ascii).unwrap().identity
+    );
+    let before = snapshot(&base);
+    let plan = plan(&base);
+    assert!(
+        plan.issues
+            .iter()
+            .any(|i| i.code == engine::ISSUE_CODE_CASE_COLLISION
+                && native::key(Path::new(&i.path)) == native::key(&ascii)),
+        "{:?}",
+        plan.issues
+    );
+    let folder_key = native::key(&ascii);
+    let folders: Vec<&Row> = plan
+        .rows
+        .iter()
+        .filter(|r| native::key(Path::new(&r.path)) == folder_key)
+        .collect();
+    assert!(!folders.is_empty(), "{:?}", plan.rows);
+    assert!(
+        folders.iter().all(|r| r.status != Status::Ready),
+        "{folders:?}"
+    );
+    let children: Vec<&Row> = plan
+        .rows
+        .iter()
+        .filter(|r| {
+            let path = Path::new(&r.path);
+            native::contains(&ascii, path) && native::key(path) != folder_key
+        })
+        .collect();
+    assert!(!children.is_empty(), "{:?}", plan.rows);
+    for child in &children {
+        assert_eq!(child.status, Status::Excluded, "{}", child.path);
+        assert!(
+            child.reason.contains("上層資料夾名稱僅大小寫不同"),
+            "{}: {}",
+            child.path,
+            child.reason
+        );
+    }
+    assert_eq!(row(&plan, &sibling).status, Status::Ready);
+    assert_eq!(apply_and_undo(&plan, &base, &before), 1);
+}
+
+/// The `\\?\Volume{GUID}\` path that mountvol lists for a drive root such as
+/// `C:\`; `None` when mountvol is unavailable or does not list the drive.
+fn mountvol_volume_for(drive_root: &str) -> Option<PathBuf> {
+    let output = Command::new("mountvol.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    // Volume GUID paths and drive roots are ASCII in every system language.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut volume = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with(r"\\?\Volume{") {
+            volume = Some(line);
+        } else if let Some(current) = volume
+            && line.eq_ignore_ascii_case(drive_root)
+        {
+            return Some(PathBuf::from(current));
+        }
+    }
+    None
+}
+
+// native-engine-3: a volume without a drive letter is addressed as
+// `\\?\Volume{GUID}\` and must stay usable as a scope.
+#[test]
+fn volume_guid_paths_are_accepted() {
+    const GUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+    let name = |text: &str| OsString::from(text);
+    assert!(native::is_volume_guid(&name(&format!("Volume{{{GUID}}}"))));
+    assert!(native::is_volume_guid(&name(&format!(
+        "Volume{{{}}}",
+        GUID.to_uppercase()
+    ))));
+    for invalid in [
+        "Volume{0123-4567}",
+        "Volume{01234567-89ab-cdef-0123-456789abcdef0}",
+        "Volume{0123456g-89ab-cdef-0123-456789abcdef}",
+        "Volume01234567-89ab-cdef-0123-456789abcdef",
+        "Volume{01234567-89ab-cdef-0123-456789abcdef",
+        "GLOBALROOT",
+        "",
+    ] {
+        assert!(!native::is_volume_guid(&name(invalid)), "{invalid}");
+    }
+    let root = PathBuf::from(format!(r"\\?\Volume{{{GUID}}}\"));
+    let item = root.join("x");
+    assert_eq!(
+        native::absolute(&item).unwrap_or_else(|e| panic!("{e:#}")),
+        item
+    );
+    assert!(native::is_volume_root(&root));
+    assert!(!native::is_volume_root(&item));
+
+    // The real volume that holds work/, reached through its GUID path.
+    init();
+    let drive = work()
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap();
+    let drive_root = format!("{drive}\\");
+    let Some(volume) = mountvol_volume_for(&drive_root) else {
+        eprintln!("略過實際磁碟區段落：mountvol 未列出 {drive_root} 的 Volume GUID 路徑");
+        return;
+    };
+    let scope = engine::scope(&volume).unwrap_or_else(|e| panic!("{}: {e:#}", volume.display()));
+    assert_eq!(scope.kind, engine::Kind::Dir);
+    assert_eq!(
+        scope.anchor_id,
+        native::metadata(Path::new(&drive_root)).unwrap().identity
+    );
 }

@@ -6,7 +6,7 @@
 - 本專案驗證工具鏈固定為 Rust `1.98.0`、target `x86_64-pc-windows-msvc`。
 - 打包與發布工具使用 Python `3.11` 以上，僅依賴標準函式庫。執行產品不需要 Python。
 - GitHub CLI 範例使用已登入的 `gh`；亦可從 Release 頁面直接下載公開附件。
-- `tests/fat_rust.rs` 以 `diskpart` 建立暫時 VHDX 驗證 FAT32 與 exFAT，需要系統管理員權限，約需 2 分鐘；沒有權限或環境不支援 VHDX 時會印出原因並略過（不算失敗）。`tests/reparse_rust.rs` 會在 `work/` 下設定自訂 tag 的 reparse point，設定失敗時同樣略過該段。其他測試不需要特殊權限。
+- `tests/fat_rust.rs` 以 `diskpart` 建立暫時 VHDX 驗證 FAT32 與 exFAT，需要系統管理員權限，約需 2 分鐘；沒有權限或環境不支援 VHDX 時會印出原因並略過（不算失敗）。`tests/reparse_rust.rs` 會在 `work/` 下設定自訂 tag 的 reparse point，設定失敗時同樣略過該段。設定環境變數 `SC2TC_REQUIRE_PRIVILEGED_TESTS`（任意值）時，這些無法執行的特權測試會直接失敗而不是略過；CI 的 `cargo test` 步驟即如此設定。其他測試不需要特殊權限。
 
 ## 下載附件與存放位置
 

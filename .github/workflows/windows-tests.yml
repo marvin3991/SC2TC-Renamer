@@ -39,6 +39,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Rust lint failed.' }
       - name: Test Rust core, UI events and dictionary updates
         shell: pwsh
+        env:
+          # FAT／reparse tests fail instead of skipping when they cannot run.
+          SC2TC_REQUIRE_PRIVILEGED_TESTS: '1'
         run: |
           chcp 65001 > $null
           cargo test --locked -- --test-threads=1

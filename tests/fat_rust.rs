@@ -1,7 +1,9 @@
 //! FAT32 and exFAT volumes on a temporary VHDX: the root reports file ID 0
 //! and renaming to a longer name assigns a new file ID. Needs administrator
 //! rights for diskpart; without them (or without virtual disk support) each
-//! test prints why and returns without failing.
+//! test prints why and returns without failing, unless
+//! `SC2TC_REQUIRE_PRIVILEGED_TESTS` is set (as in CI), which turns the skip
+//! into a failure.
 use sc2tc_renamer::{
     converter::Mode,
     engine::{self, Plan, Status},
@@ -15,14 +17,118 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
+    ptr,
     sync::{Once, atomic::AtomicBool},
+    time::Duration,
 };
 use uuid::Uuid;
 use windows_sys::Win32::{
     Storage::FileSystem::GetLogicalDrives, System::Threading::CREATE_NO_WINDOW,
 };
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    // Win32_Globalization is not an enabled windows-sys feature; declared from
+    // stringapiset.h so the test does not change the product's dependencies.
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        text: *const u8,
+        text_length: i32,
+        wide: *mut u16,
+        wide_length: i32,
+    ) -> i32;
+}
+/// winnls.h: the system OEM code page, which diskpart writes to a pipe.
+const CP_OEMCP: u32 = 1;
+
 const TEST_NAME: &str = "fat_rust";
+/// When set (CI sets it), a privileged test that cannot run fails instead of
+/// being skipped, so a green run proves the FAT tests actually executed.
+const REQUIRE_PRIVILEGED_TESTS: &str = "SC2TC_REQUIRE_PRIVILEGED_TESTS";
+/// diskpart output that means the environment, not the script, refused the
+/// virtual disk: access or privilege errors and Virtual Disk Service failures,
+/// in English and in the Traditional and Simplified Chinese system languages.
+const ENVIRONMENT_LIMIT_MARKERS: &[&str] = &[
+    "Access is denied",
+    "access denied",
+    "permission",
+    "privilege",
+    "Virtual Disk Service",
+    "存取被拒",
+    "權限",
+    "虛擬磁碟服務",
+    "拒绝访问",
+    "权限",
+    "虚拟磁盘服务",
+];
+/// Other tests and test processes share the cross-process operation lock,
+/// which `apply` and `undo` take without waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+
+/// Holds the operation lock for the rest of a test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `apply` and `undo` in the test still acquire it.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
+/// Reports a test that cannot run here: a failure when
+/// `SC2TC_REQUIRE_PRIVILEGED_TESTS` is set, otherwise a printed skip. The
+/// caller returns afterwards.
+fn skip_or_fail(reason: &str) {
+    if std::env::var_os(REQUIRE_PRIVILEGED_TESTS).is_some() {
+        panic!("{REQUIRE_PRIVILEGED_TESTS} 已設定，特權測試不得略過：{reason}");
+    }
+    eprintln!("略過：{reason}");
+}
+/// Whether a failed diskpart run was refused by the environment rather than
+/// by a wrong script.
+fn environment_limited(output: &str) -> bool {
+    ENVIRONMENT_LIMIT_MARKERS
+        .iter()
+        .any(|marker| output.contains(marker))
+}
+/// Decodes console output written in the OEM code page (for example Big5 on a
+/// Traditional Chinese system), so messages stay readable and searchable.
+fn oem_text(bytes: &[u8]) -> String {
+    let Ok(length) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    if length == 0 {
+        return String::new();
+    }
+    let units =
+        unsafe { MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), length, ptr::null_mut(), 0) };
+    if units <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0_u16; units as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            length,
+            wide.as_mut_ptr(),
+            units,
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
+}
 /// Small test disk; diskpart on Windows 11 formats it as both FAT32 and exFAT.
 const VHDX_MEGABYTES: u32 = 64;
 const VOLUME_LABEL: &str = "SC2TCFAT";
@@ -75,7 +181,7 @@ fn diskpart(directory: &Path, lines: &[String]) -> Result<(), DiskpartError> {
         Ok(output) => Err(DiskpartError::Failed(format!(
             "diskpart 結束代碼 {:?}：{}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stdout)
+            oem_text(&output.stdout)
         ))),
         Err(error) => Err(DiskpartError::Launch(format!("無法執行 diskpart：{error}"))),
     }
@@ -110,7 +216,7 @@ impl VirtualVolume {
         let vdisk = format!("select vdisk file=\"{}\"", volume.file.display());
         let letters = free_letters();
         let Some(&first) = letters.first() else {
-            eprintln!("略過：沒有可用的磁碟代號");
+            skip_or_fail("沒有可用的磁碟代號");
             return None;
         };
         let created = diskpart(
@@ -127,23 +233,29 @@ impl VirtualVolume {
                 format!("assign letter={first}"),
             ],
         );
-        match created {
+        let first_error = match created {
             Ok(()) => {
                 volume.letter = Some(first);
                 return Some(volume);
             }
             Err(DiskpartError::Launch(error)) => {
-                eprintln!("略過：無法執行 diskpart（需要系統管理員權限）：{error}");
+                skip_or_fail(&format!("無法執行 diskpart（需要系統管理員權限）：{error}"));
                 return None;
             }
             Err(DiskpartError::Failed(error)) if !volume.file.exists() => {
-                eprintln!("略過：此環境無法建立虛擬磁碟：{error}");
-                return None;
+                // Only a refusal by the environment is a skip; any other
+                // failure means the script itself is wrong.
+                if environment_limited(&error) {
+                    skip_or_fail(&format!("此環境無法建立虛擬磁碟：{error}"));
+                    return None;
+                }
+                panic!("建立 {file_system} 虛擬磁碟失敗：{error}");
             }
             Err(DiskpartError::Failed(error)) => {
                 eprintln!("第一次建立 {file_system} 磁碟未完成，改用其他代號：{error}");
+                error
             }
-        }
+        };
         for letter in letters.into_iter().skip(1).take(ASSIGN_RETRIES) {
             let assigned = diskpart(
                 &volume.directory,
@@ -158,8 +270,13 @@ impl VirtualVolume {
                 return Some(volume);
             }
         }
-        eprintln!("略過：無法完成 {file_system} 虛擬磁碟的格式化或代號指派");
-        None
+        if environment_limited(&first_error) {
+            skip_or_fail(&format!(
+                "無法完成 {file_system} 虛擬磁碟的格式化或代號指派：{first_error}"
+            ));
+            return None;
+        }
+        panic!("無法完成 {file_system} 虛擬磁碟的格式化或代號指派：{first_error}");
     }
     fn root(&self) -> PathBuf {
         PathBuf::from(format!("{}:\\", self.letter.unwrap()))
@@ -379,6 +496,9 @@ fn fat32_root_rename_interruption_and_recovery() {
     let Some(volume) = VirtualVolume::create("fat32") else {
         return;
     };
+    // Taken after the slow diskpart setup and released before the volume
+    // is detached, so other processes wait only for apply and undo.
+    let _lock = exclusive();
     root_rename_and_recovery(&volume);
     interrupted_rename_is_reconciled(&volume);
 }
@@ -388,6 +508,9 @@ fn exfat_root_rename_interruption_and_recovery() {
     let Some(volume) = VirtualVolume::create("exfat") else {
         return;
     };
+    // Taken after the slow diskpart setup and released before the volume
+    // is detached, so other processes wait only for apply and undo.
+    let _lock = exclusive();
     root_rename_and_recovery(&volume);
     interrupted_rename_is_reconciled(&volume);
 }

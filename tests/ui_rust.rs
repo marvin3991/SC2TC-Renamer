@@ -7,6 +7,7 @@ use sc2tc_renamer::{
     converter::Mode,
     diagnostics, engine,
     journal::{self, Journal, UndoAction},
+    native,
     ui::{App, DEFAULT_SIZE, MIN_SIZE},
     updater::Store,
 };
@@ -23,6 +24,27 @@ use uuid::Uuid;
 /// Upper bound for a background job in these tests.
 const JOB_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Other test processes share the cross-process operation lock, which `apply`
+/// and `undo` take without waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+
+/// Holds the operation lock for a whole test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `apply` and `undo` in the test still acquire it.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
 
 static DICTIONARY_STORE: Once = Once::new();
 /// Points `Store::standard()` at an empty store under work/, so the tests use
@@ -268,6 +290,63 @@ fn close_while_busy_is_cancelled_with_visible_notice() {
     assert!(app.notice().is_none());
 }
 
+// ui-main-3: a path dropped while the window waits for a safe stop adds
+// nothing and leaves the stopping notice in place.
+#[test]
+fn drop_while_stopping_keeps_the_stopping_notice() {
+    let base = fixture();
+    let file = base.join("软件.txt");
+    fs::write(&file, b"source").unwrap();
+    let history = fixture();
+    let ctx = Context::default();
+    let mut app = App::new(&ctx, history.to_path_buf());
+    let (release, gate) = mpsc::channel();
+    app.spawn_waiting_job_for_test(&ctx, gate);
+    let output = run_frame(&ctx, &mut app, DEFAULT_SIZE, Some(close_request()));
+    assert!(cancels_close(&output));
+    assert!(
+        app.notice().is_some_and(|n| n.contains("正在安全停止")),
+        "{:?}",
+        app.notice()
+    );
+    frame(&ctx, &mut app, DEFAULT_SIZE, Some(drop_input(&file)));
+    assert!(app.busy());
+    assert!(
+        app.notice().is_some_and(|n| n.contains("正在安全停止")),
+        "{:?}",
+        app.notice()
+    );
+    assert!(app.scopes.is_empty());
+    release.send(()).unwrap();
+    wait_idle(&ctx, &mut app);
+    assert!(app.scopes.is_empty());
+}
+
+// Control for ui-main-3: without a pending stop, a drop during a job is
+// refused with the "processing" notice.
+#[test]
+fn drop_while_busy_reports_processing_notice() {
+    let base = fixture();
+    let file = base.join("软件.txt");
+    fs::write(&file, b"source").unwrap();
+    let history = fixture();
+    let ctx = Context::default();
+    let mut app = App::new(&ctx, history.to_path_buf());
+    let (release, gate) = mpsc::channel();
+    app.spawn_waiting_job_for_test(&ctx, gate);
+    frame(&ctx, &mut app, DEFAULT_SIZE, Some(drop_input(&file)));
+    assert!(app.busy());
+    assert!(
+        app.notice().is_some_and(|n| n.contains("正在處理")),
+        "{:?}",
+        app.notice()
+    );
+    assert!(app.scopes.is_empty());
+    release.send(()).unwrap();
+    wait_idle(&ctx, &mut app);
+    assert!(app.scopes.is_empty());
+}
+
 #[test]
 fn input_while_busy_is_refused_without_losing_typed_path() {
     let base = fixture();
@@ -300,6 +379,7 @@ fn input_while_busy_is_refused_without_losing_typed_path() {
 
 #[test]
 fn file_scope_follows_apply_and_undo() {
+    let _lock = exclusive();
     let base = fixture();
     let source = base.join("软件.txt");
     fs::write(&source, b"source").unwrap();
@@ -412,6 +492,23 @@ fn failure_report_only_for_flag_with_output_path() {
             diagnostics::failure_report_path(&args(&[flag, "work\\check-1"])),
             Some(PathBuf::from("work\\check-1.failure.json")),
             "{flag}"
+        );
+    }
+    // ui-main-4: the report suffix is appended, never replacing an extension.
+    for (items, expected) in [
+        (
+            ["--check-dictionary-update", "work\\update.json"],
+            "work\\update.json.failure.json",
+        ),
+        (
+            ["--self-test", "work\\check-1.2"],
+            "work\\check-1.2.failure.json",
+        ),
+    ] {
+        assert_eq!(
+            diagnostics::failure_report_path(&args(&items)),
+            Some(PathBuf::from(expected)),
+            "{items:?}"
         );
     }
 }
