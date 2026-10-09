@@ -19,6 +19,7 @@
 - 不支援 `\\.\` 裝置路徑與 `\??\` NT 路徑；請改用一般磁碟、網路路徑或 `\\?\Volume{GUID}\` 磁碟區路徑。
 - 命令列旗標失敗時的報告檔名改為在輸出路徑後直接附加 `.failure.json`（例如 `work\update.json` → `work\update.json.failure.json`）；`--ui-self-check` 與 `--self-test` 一樣改用隔離的字典儲存。
 - `SHA256SUMS.txt` 只列 Release 附件，可直接在下載資料夾核對；執行檔的 SHA-256 改見 `release-manifest.json`。
+- portable ZIP 附帶 `CHANGELOG.md`，README 的版本變更連結解壓後可直接開啟。
 - 公開的 `verification.json` 只記錄測試資料夾名稱，不再包含建置機器的完整路徑。
 - 轉換表更新：程式升級後若啟用中的字典包不相容或驗證失敗，訊息會提示按「回復內附轉換表」，再重新下載套用；已暫存的同版本目錄失效時改名為 `stale-*` 保留，再重新暫存。
 - 字典鎖逾時改顯示「另一個視窗正在更新轉換表，請稍後再試。」，與改名／復原的作業鎖訊息分開。
