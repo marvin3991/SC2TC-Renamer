@@ -7,6 +7,7 @@ use sc2tc_renamer::{
     native,
     updater::Store,
 };
+use serde_json::{Value, json};
 use std::{
     ffi::c_void,
     fs,
@@ -15,6 +16,7 @@ use std::{
     process::Command,
     ptr,
     sync::{Once, atomic::AtomicBool},
+    time::Duration,
 };
 use uuid::Uuid;
 use windows_sys::Win32::{
@@ -24,6 +26,20 @@ use windows_sys::Win32::{
 };
 
 const TEST_NAME: &str = "reparse_rust";
+/// When set (CI sets it), a privileged test that cannot run fails instead of
+/// being skipped, so a green run proves the reparse tests actually executed.
+const REQUIRE_PRIVILEGED_TESTS: &str = "SC2TC_REQUIRE_PRIVILEGED_TESTS";
+/// Other tests and test processes share the cross-process operation lock,
+/// which `apply` and `undo` take without waiting.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 600 attempts × 100 ms: wait up to one minute for those holders.
+const LOCK_RETRY_LIMIT: u32 = 600;
+/// Protection reason that v1.0.0 recorded for every reparse point
+/// (`LINK_REASON` in src/engine.rs).
+const V1_0_0_LINK_REASON: &str = "連結／接合點：不進入、不改名";
+/// An ASCII name that the conversion leaves unchanged, so apply never renames
+/// the reparse item itself.
+const PLACEHOLDER_NAME: &str = "cloud-placeholder.bin";
 /// winnt.h reparse tags.
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -53,6 +69,31 @@ unsafe extern "system" {
         returned: *mut u32,
         overlapped: *mut c_void,
     ) -> i32;
+}
+
+/// Holds the operation lock for a whole test (same helper as
+/// tests/journal_rust.rs). The mutex is re-entrant for its owning thread, so
+/// `apply` and `undo` in the test still acquire it.
+fn exclusive() -> native::OperationLock {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        match native::OperationLock::acquire() {
+            Ok(lock) => return lock,
+            Err(error) if error.to_string() == native::OPERATION_BUSY => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL)
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("{}", native::OPERATION_BUSY);
+}
+/// Reports a test that cannot run here: a failure when
+/// `SC2TC_REQUIRE_PRIVILEGED_TESTS` is set, otherwise a printed skip. The
+/// caller returns afterwards.
+fn skip_or_fail(reason: &str) {
+    if std::env::var_os(REQUIRE_PRIVILEGED_TESTS).is_some() {
+        panic!("{REQUIRE_PRIVILEGED_TESTS} 已設定，特權測試不得略過：{reason}");
+    }
+    eprintln!("略過：{reason}");
 }
 
 fn work() -> PathBuf {
@@ -148,6 +189,7 @@ fn only_name_surrogate_tags_are_links() {
 
 #[test]
 fn junction_is_rejected_as_scope_and_never_entered() {
+    let _lock = exclusive();
     let base = fixture();
     let outside = base.join("outside").join("外部资料");
     write(&outside, "报告.txt");
@@ -211,6 +253,7 @@ fn junction_is_rejected_as_scope_and_never_entered() {
 
 #[test]
 fn folder_replaced_by_junction_after_scan_stops_before_apply() {
+    let _lock = exclusive();
     let base = fixture();
     let root = base.join("root");
     write(&root, "简体目录/报告.txt");
@@ -285,12 +328,13 @@ fn set_third_party_reparse_point(path: &Path) -> bool {
 
 #[test]
 fn third_party_reparse_file_is_renamed_like_an_ordinary_file() {
+    let _lock = exclusive();
     let base = fixture();
     let root = base.join("root");
     let source = write(&root, "报告.txt");
     let size = fs::metadata(&source).unwrap().len();
     if !set_third_party_reparse_point(&source) {
-        eprintln!("略過：此環境無法設定非名稱代理的 reparse point（需要相應權限）。");
+        skip_or_fail("此環境無法設定非名稱代理的 reparse point（需要相應權限）。");
         return;
     }
     let info = native::metadata(&source).unwrap();
@@ -320,4 +364,136 @@ fn third_party_reparse_file_is_renamed_like_an_ordinary_file() {
     // The file cannot be opened without its (absent) filter driver; remove it
     // so later tools that walk work/ do not trip over it.
     fs::remove_dir_all(&base).unwrap();
+}
+
+/// A journal whose plan.json has the shape v1.0.0 wrote for a scope holding a
+/// non-name-surrogate reparse file (cloud placeholder): one ordinary file was
+/// renamed, and the reparse file was recorded as a protected link.
+struct LegacyRecord {
+    base: PathBuf,
+    root: PathBuf,
+    placeholder: PathBuf,
+    journal: Journal,
+    before: Vec<String>,
+}
+
+/// Applies the rename with the current version, then rewrites the record of
+/// the reparse file as v1.0.0 did: kind "link", the link protection reason, and
+/// an identity without size or modification time. The item is a file, so no
+/// child records exist below it. `None` when the reparse point cannot be set.
+fn legacy_reparse_record() -> Option<LegacyRecord> {
+    let base = fixture();
+    let root = base.join("root");
+    write(&root, "报告.txt");
+    let placeholder = write(&root, PLACEHOLDER_NAME);
+    if !set_third_party_reparse_point(&placeholder) {
+        skip_or_fail("此環境無法設定非名稱代理的 reparse point（需要相應權限）。");
+        return None;
+    }
+    let before = names(&root);
+    let plan = plan(&root);
+    let item = row(&plan, &placeholder);
+    assert_eq!(item.kind, Kind::File);
+    assert_eq!(item.status, Status::Unchanged);
+    let journal = Journal::create(&fixture(), &plan).unwrap();
+    assert_eq!(
+        journal::apply(&plan, &journal, &AtomicBool::new(false), &|_| {})
+            .unwrap_or_else(|e| panic!("{e:#}")),
+        1
+    );
+
+    let file = journal.directory.join("plan.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let key = native::key(&placeholder);
+    let is_placeholder =
+        |item: &Value| native::key(Path::new(item["path"].as_str().unwrap())) == key;
+    let as_v1_0_0 = |item: &mut Value| {
+        item["kind"] = json!("link");
+        let identity = item["identity"].as_object_mut().unwrap();
+        identity.remove("size");
+        identity.remove("modified_ticks");
+    };
+    let mut records = 0;
+    for record in value["records"].as_array_mut().unwrap() {
+        if is_placeholder(record) {
+            as_v1_0_0(record);
+            record["protected"] = json!(V1_0_0_LINK_REASON);
+            records += 1;
+        }
+    }
+    let mut rows = 0;
+    for row in value["rows"].as_array_mut().unwrap() {
+        if is_placeholder(row) {
+            as_v1_0_0(row);
+            row["status"] = json!("excluded");
+            row["reason"] = json!(V1_0_0_LINK_REASON);
+            rows += 1;
+        }
+    }
+    assert_eq!((records, rows), (1, 1));
+    fs::write(&file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let rewritten = journal.load().unwrap();
+    assert_eq!(row(&rewritten, &placeholder).kind, Kind::Link);
+    Some(LegacyRecord {
+        base,
+        root,
+        placeholder,
+        journal,
+        before,
+    })
+}
+
+// native-engine-1: a v1.0.0 record that listed a cloud placeholder as a link
+// still undoes after the item is classified as an ordinary file.
+#[test]
+fn v1_0_0_record_with_non_surrogate_reparse_file_can_be_undone() {
+    let _lock = exclusive();
+    let Some(legacy) = legacy_reparse_record() else {
+        return;
+    };
+    let cancel = AtomicBool::new(false);
+    let (_, actions) = journal::prepare_undo(&legacy.journal, &cancel, &|_| {})
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        journal::undo(&legacy.journal, &cancel, &|_| {}).unwrap_or_else(|e| panic!("{e:#}")),
+        1
+    );
+    assert_eq!(names(&legacy.root), legacy.before);
+    fs::remove_dir_all(&legacy.base).unwrap();
+}
+
+// Control for native-engine-1: the compatibility rule applies only to items
+// that are still non-surrogate reparse points. A junction put in place of the
+// recorded item is a different object and stops the undo.
+#[test]
+fn v1_0_0_link_record_does_not_accept_a_junction_in_its_place() {
+    let _lock = exclusive();
+    let Some(legacy) = legacy_reparse_record() else {
+        return;
+    };
+    fs::remove_file(&legacy.placeholder).unwrap();
+    let elsewhere = legacy.base.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    junction(&legacy.placeholder, &elsewhere);
+    assert!(native::metadata(&legacy.placeholder).unwrap().link);
+    let error = journal::prepare_undo(&legacy.journal, &AtomicBool::new(false), &|_| {})
+        .err()
+        .expect("接合點取代紀錄中的項目時不得放行復原");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("範圍已有新增、移除、修改或替換的項目"),
+        "{message}"
+    );
+    assert!(legacy.root.join("報告.txt").exists());
+    assert!(
+        !legacy
+            .journal
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| e["event"] == "undo_start")
+    );
+    fs::remove_dir(&legacy.placeholder).unwrap();
+    fs::remove_dir_all(&legacy.base).unwrap();
 }
