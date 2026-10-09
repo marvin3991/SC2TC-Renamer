@@ -724,3 +724,138 @@ fn dictionary_lock_busy_reports_dictionary_update() {
     assert_ne!(message, native::OPERATION_BUSY);
     assert!(native::OperationLock::dictionary_with_timeout(FREE_WAIT_MS).is_ok());
 }
+
+// native-engine-2: two folders whose names differ only by case. The second
+// one is protected and not expanded; the children already listed below the
+// first one must not stay Ready (their parent record was replaced).
+#[test]
+fn case_collision_between_folders_excludes_their_children() {
+    let _lock = exclusive();
+    let base = fixture();
+    // U+212A KELVIN SIGN: both folder names share one key, yet NTFS keeps
+    // them apart in an ordinary case-insensitive folder.
+    let kelvin = base.join("简\u{212A}");
+    let ascii = base.join("简k");
+    write(&kelvin, "报告.txt");
+    write(&ascii, "软件.txt");
+    let sibling = write(&base, "说明.txt");
+    assert_eq!(native::key(&kelvin), native::key(&ascii));
+    assert_ne!(
+        native::metadata(&kelvin).unwrap().identity,
+        native::metadata(&ascii).unwrap().identity
+    );
+    let before = snapshot(&base);
+    let plan = plan(&base);
+    assert!(
+        plan.issues
+            .iter()
+            .any(|i| i.code == engine::ISSUE_CODE_CASE_COLLISION
+                && native::key(Path::new(&i.path)) == native::key(&ascii)),
+        "{:?}",
+        plan.issues
+    );
+    let folder_key = native::key(&ascii);
+    let folders: Vec<&Row> = plan
+        .rows
+        .iter()
+        .filter(|r| native::key(Path::new(&r.path)) == folder_key)
+        .collect();
+    assert!(!folders.is_empty(), "{:?}", plan.rows);
+    assert!(
+        folders.iter().all(|r| r.status != Status::Ready),
+        "{folders:?}"
+    );
+    let children: Vec<&Row> = plan
+        .rows
+        .iter()
+        .filter(|r| {
+            let path = Path::new(&r.path);
+            native::contains(&ascii, path) && native::key(path) != folder_key
+        })
+        .collect();
+    assert!(!children.is_empty(), "{:?}", plan.rows);
+    for child in &children {
+        assert_eq!(child.status, Status::Excluded, "{}", child.path);
+        assert!(
+            child.reason.contains("上層資料夾名稱僅大小寫不同"),
+            "{}: {}",
+            child.path,
+            child.reason
+        );
+    }
+    assert_eq!(row(&plan, &sibling).status, Status::Ready);
+    assert_eq!(apply_and_undo(&plan, &base, &before), 1);
+}
+
+/// The `\\?\Volume{GUID}\` path that mountvol lists for a drive root such as
+/// `C:\`; `None` when mountvol is unavailable or does not list the drive.
+fn mountvol_volume_for(drive_root: &str) -> Option<PathBuf> {
+    let output = Command::new("mountvol.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    // Volume GUID paths and drive roots are ASCII in every system language.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut volume = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with(r"\\?\Volume{") {
+            volume = Some(line);
+        } else if let Some(current) = volume
+            && line.eq_ignore_ascii_case(drive_root)
+        {
+            return Some(PathBuf::from(current));
+        }
+    }
+    None
+}
+
+// native-engine-3: a volume without a drive letter is addressed as
+// `\\?\Volume{GUID}\` and must stay usable as a scope.
+#[test]
+fn volume_guid_paths_are_accepted() {
+    const GUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+    let name = |text: &str| OsString::from(text);
+    assert!(native::is_volume_guid(&name(&format!("Volume{{{GUID}}}"))));
+    assert!(native::is_volume_guid(&name(&format!(
+        "Volume{{{}}}",
+        GUID.to_uppercase()
+    ))));
+    for invalid in [
+        "Volume{0123-4567}",
+        "Volume{01234567-89ab-cdef-0123-456789abcdef0}",
+        "Volume{0123456g-89ab-cdef-0123-456789abcdef}",
+        "Volume01234567-89ab-cdef-0123-456789abcdef",
+        "Volume{01234567-89ab-cdef-0123-456789abcdef",
+        "GLOBALROOT",
+        "",
+    ] {
+        assert!(!native::is_volume_guid(&name(invalid)), "{invalid}");
+    }
+    let root = PathBuf::from(format!(r"\\?\Volume{{{GUID}}}\"));
+    let item = root.join("x");
+    assert_eq!(
+        native::absolute(&item).unwrap_or_else(|e| panic!("{e:#}")),
+        item
+    );
+    assert!(native::is_volume_root(&root));
+    assert!(!native::is_volume_root(&item));
+
+    // The real volume that holds work/, reached through its GUID path.
+    init();
+    let drive = work()
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap();
+    let drive_root = format!("{drive}\\");
+    let Some(volume) = mountvol_volume_for(&drive_root) else {
+        eprintln!("略過實際磁碟區段落：mountvol 未列出 {drive_root} 的 Volume GUID 路徑");
+        return;
+    };
+    let scope = engine::scope(&volume).unwrap_or_else(|e| panic!("{}: {e:#}", volume.display()));
+    assert_eq!(scope.kind, engine::Kind::Dir);
+    assert_eq!(
+        scope.anchor_id,
+        native::metadata(Path::new(&drive_root)).unwrap().identity
+    );
+}
